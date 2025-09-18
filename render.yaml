@@ -1,0 +1,43 @@
+services:
+  - type: worker
+    name: bybit-macd-bot
+    env: python
+    pythonVersion: 3.11.9 # <— ключевая строка
+    plan: starter
+    buildCommand: >
+      pip install --upgrade pip setuptools wheel &&
+      pip install --no-cache-dir --only-binary=:all: -r requirements.txt
+    startCommand: python -u main.py
+    envVars:
+      - key: TIMEFRAMES
+        value: 4H,1D,1W
+      - key: SORT_TF
+        value: 1D
+      - key: TOP_N
+        value: 100
+      - key: WORKERS
+        value: 8
+      - key: USE_TICKERS_PREFILTER
+        value: 1
+      - key: PREFILTER_MULTIPLIER
+        value: 1
+      - key: PER_REQUEST_SLEEP_MS
+        value: 300
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: BYBIT_RECV_WINDOW
+        value: 20000
+      - key: BYBIT_CATEGORY
+        value: linear
+      - key: OUTPUT_DIR
+        value: /data/output
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
