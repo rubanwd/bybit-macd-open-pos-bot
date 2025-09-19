@@ -87,6 +87,60 @@ def rsi_sum(item, tfs):
 def now_iso():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
+def fmt2(x: float) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return "-"
+
+def snapshot_rsi(api: BybitAPI, symbol: str, rsi_period: int) -> Dict[str, float]:
+    """
+    Возвращает RSI для таймфреймов 5M, 15M, 1H.
+    Если эти RSI уже были вычислены в ходе отбора (it["rsi_5M"] и т.п.) — возьмём их,
+    иначе быстро дольём свечи и посчитаем тут.
+    """
+    out: Dict[str, float] = {}
+    for tf_code in ["5M", "15M", "1H"]:
+        try:
+            interval = TF_TO_BYBIT[tf_code]
+            # нужно ≥ 50 баров для устойчивости
+            kl = api.get_klines(symbol, interval, limit=60)
+            df = kline_to_df(kl)
+            rs = rsi(df["close"], rsi_period)
+            out[tf_code] = float(rs.iloc[-1])
+        except Exception:
+            # если совсем не смогли — 0
+            out[tf_code] = 0.0
+    return out
+
+def fmt_tp_sl(value: float) -> str:
+    """
+    Отформатировать число так, чтобы после ведущих нулей в дробной части
+    осталось ровно три значащих цифры (без округления, просто отсечение).
+    Примеры:
+      0.0455500001 -> 0.0455
+      0.0441400000 -> 0.0441
+      0.4555000000 -> 0.455
+      0.0000455    -> 0.0000455
+    """
+    s = f"{float(value):.18f}".rstrip("0")
+    if "." not in s:
+        return s
+    intp, frac = s.split(".", 1)
+    # считаем ведущие нули в дробной части
+    i = 0
+    while i < len(frac) and frac[i] == "0":
+        i += 1
+    # оставляем три значащих цифры после первых нулей
+    keep = frac[i:i + 3]
+    if not keep:
+        # на всякий случай, если все нули
+        return intp + "." + frac
+    new_frac = frac[:i] + keep
+    return intp + "." + new_frac
+
+
+
 
 def main_loop():
     load_dotenv()
@@ -406,12 +460,35 @@ def main_loop():
 
                                 if tg_trades:
                                     try:
-                                        tg_trades.send_message(
+                                        # --- подготовим красивое уведомление ---
+                                        atr_abs = float(it.get(f"atr_abs_{ATR_TF_FOR_SLTP}", 0.0))
+                                        last_px = float(it["last_price"] or 0.0)
+                                        atr_pct = (atr_abs / last_px * 100.0) if last_px > 0 else 0.0
+
+                                        # RSI снимок на 5M/15M/1H (на текущую минуту)
+                                        rsi_snap = snapshot_rsi(api, sym, RSI_PERIOD)
+                                        rsi_5m = rsi_snap.get("5M", 0.0)
+                                        rsi_15m = rsi_snap.get("15M", 0.0)
+                                        rsi_1h = rsi_snap.get("1H", 0.0)
+
+                                        msg = (
                                             f"🔔 Открыта позиция {sym} {order_side}\n"
                                             f"Цена: {entry_price or last_price:.8f}\n"
-                                            f"Кол-во: {qty}\nПлечо: x{LEVERAGE}\nTP: {tp}\nSL: {sl}\n"
-                                            f"ATR({ATR_TF_FOR_SLTP})={atr_abs:.8f}\nВремя: {now_iso()}"
+                                            f"Кол-во: {qty}\n"
+                                            f"Плечо: x{LEVERAGE}\n"
+                                            f"TP: {fmt_tp_sl(tp)}\n"
+                                            f"SL: {fmt_tp_sl(sl)}\n"
+                                            f"ATR({ATR_TF_FOR_SLTP})={fmt2(atr_pct)}%\n"
+                                            f"RSI ➜ 5M: {fmt2(rsi_5m)} | 15M: {fmt2(rsi_15m)} | 1H: {fmt2(rsi_1h)}\n"
+                                            f"Время: {now_iso()}"
                                         )
+
+                                        if tg_trades:
+                                            try:
+                                                tg_trades.send_message(msg)
+                                            except Exception as e:
+                                                logging.error(f"Ошибка sendMessage: {e}")
+
                                     except Exception as e:
                                         logging.error(f"Ошибка sendMessage: {e}")
 
