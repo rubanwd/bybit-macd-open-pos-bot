@@ -16,6 +16,7 @@ from telegram_utils import TelegramClient
 
 
 TF_TO_BYBIT = {
+    "1M": "1",
     "5M": "5",
     "15M": "15",
     "30M": "30",
@@ -177,6 +178,7 @@ def main_loop():
 
     TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "1H,4H,1D"))
     SORT_TF = check_sort_tf(os.getenv("SORT_TF", TIMEFRAMES[0]), TIMEFRAMES)
+    REOPEN_COOLDOWN_HOURS = env_int("REOPEN_COOLDOWN_HOURS", 24)
     if ATR_TF_FOR_SLTP not in TIMEFRAMES:
         TIMEFRAMES.append(ATR_TF_FOR_SLTP)
 
@@ -403,10 +405,12 @@ def main_loop():
                                 if api.has_open_position(sym):
                                     continue
                                 try:
-                                    if api.had_closed_within(sym, 24):
+                                    if api.had_closed_within(sym, REOPEN_COOLDOWN_HOURS):
                                         continue
                                 except Exception as e:
                                     logging.warning(f"closed-pnl check failed for {sym}: {e}")
+                                    if os.getenv("COOLDOWN_BLOCK_ON_ERROR", "1").lower() not in ("0", "false"):
+                                        continue
 
                                 last_price = float(it["last_price"])
                                 if last_price <= 0:
