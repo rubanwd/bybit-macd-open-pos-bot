@@ -14,7 +14,6 @@ from indicators import macd, rsi, atr
 from reporter import build_report_txt, write_report_file
 from telegram_utils import TelegramClient
 
-
 TF_TO_BYBIT = {
     "5M": "5",
     "15M": "15",
@@ -29,43 +28,30 @@ TF_TO_BYBIT = {
 }
 LONG_TF_CODES = {"W", "M"}
 
-
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-
 def env_int(n, d):
-    try:
-        return int(os.getenv(n, d))
-    except Exception:
-        return d
-
+    try: return int(os.getenv(n, d))
+    except Exception: return d
 
 def env_float(n, d):
-    try:
-        return float(os.getenv(n, d))
-    except Exception:
-        return d
-
+    try: return float(os.getenv(n, d))
+    except Exception: return d
 
 def parse_timeframes(s):
-    if not s:
-        return ["1D", "1W"]
+    if not s: return ["1D", "1W"]
     items = [x.strip().upper() for x in s.split(",") if x.strip()]
     return [x for x in items if x in TF_TO_BYBIT] or ["1D", "1W"]
 
-
 def check_sort_tf(s, tfs):
     s = (s or "").strip().upper()
-    if s in tfs:
-        return s
+    if s in tfs: return s
     logging.warning(f"SORT_TF={s} не найден в TIMEFRAMES. Использую {tfs[0]}.")
     return tfs[0]
 
-
 def kline_to_df(kl):
     return pd.DataFrame(kl)[["open", "high", "low", "close"]].astype(float)
-
 
 def compute_indicators(df, mf, ms, msig, rper, aper):
     ml, sl, h = macd(df["close"], mf, ms, msig)
@@ -73,55 +59,36 @@ def compute_indicators(df, mf, ms, msig, rper, aper):
     asr = atr(df["high"], df["low"], df["close"], aper)
     return ml, sl, h, rs, asr
 
-
 def classify_trend(ml, sl, h):
     bull = (ml.iloc[-1] > sl.iloc[-1]) and (h.iloc[-1] > 0)
     bear = (ml.iloc[-1] < sl.iloc[-1]) and (h.iloc[-1] < 0)
     return "BULL" if bull else ("BEAR" if bear else "NEUTRAL")
 
-
 def rsi_sum(item, tfs):
     return sum(float(item.get(f"rsi_{tf}", 0.0)) for tf in tfs)
 
-
-def now_iso():
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-
+def now_iso(): return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 def fmt2(x: float) -> str:
-    try:
-        return f"{float(x):.2f}"
-    except Exception:
-        return "-"
-
+    try: return f"{float(x):.2f}"
+    except Exception: return "-"
 
 def fmt_tp_sl(value: float) -> str:
     """
-    Форматируем число так, чтобы после ведущих нулей в дробной части
-    осталось ровно три значащих цифры (без округления).
-    Примеры:
-      0.0455500001 -> 0.0455
-      0.0441400000 -> 0.0441
-      0.4555000000 -> 0.455
-      0.0000455    -> 0.0000455
+    Печатаем TP/SL «читаемо»: оставляем ровно три значащих цифры после ведущих нулей.
     """
     s = f"{float(value):.18f}".rstrip("0")
-    if "." not in s:
-        return s
+    if "." not in s: return s
     intp, frac = s.split(".", 1)
     i = 0
-    while i < len(frac) and frac[i] == "0":
-        i += 1
-    keep = frac[i:i + 3]
-    if not keep:
-        return intp + "." + frac
-    new_frac = frac[:i] + keep
-    return intp + "." + new_frac
-
+    while i < len(frac) and frac[i] == "0": i += 1
+    keep = frac[i:i+3]
+    if not keep: return intp + "." + frac
+    return intp + "." + (frac[:i] + keep)
 
 def snapshot_rsi(api: BybitAPI, symbol: str, rsi_period: int) -> Dict[str, float]:
     """
-    Возвращает RSI для таймфреймов 5M, 15M, 1H (быстрая подзагрузка).
+    Быстрая подзагрузка RSI для 5M, 15M, 1H (60 баров).
     """
     out: Dict[str, float] = {}
     for tf_code in ["5M", "15M", "1H"]:
@@ -135,20 +102,18 @@ def snapshot_rsi(api: BybitAPI, symbol: str, rsi_period: int) -> Dict[str, float
             out[tf_code] = 0.0
     return out
 
-
-def get_rsi_15m_value(api: BybitAPI, item: Dict, rsi_period: int) -> float:
-    """Берём RSI(15M) из item, если он уже есть, иначе — подсчитываем по свечам."""
-    sym = item["exchange_symbol"]
-    key = "rsi_15M"
-    if key in item and float(item[key]) > 0:
-        return float(item[key])
+def compute_atr_abs(api: BybitAPI, symbol: str, tf_code: str, atr_period: int) -> float:
+    """
+    Подсчёт ATR(abs) для указанного TF (если его нет в item).
+    """
     try:
-        kl = api.get_klines(sym, TF_TO_BYBIT["15M"], limit=60)
+        interval = TF_TO_BYBIT[tf_code]
+        kl = api.get_klines(symbol, interval, limit=120)
         df = kline_to_df(kl)
-        return float(rsi(df["close"], rsi_period).iloc[-1])
+        aser = atr(df["high"], df["low"], df["close"], atr_period)
+        return float(aser.iloc[-1])
     except Exception:
         return 0.0
-
 
 def main_loop():
     load_dotenv()
@@ -183,11 +148,22 @@ def main_loop():
     TP_ATR_MULT = env_float("TP_ATR_MULT", 1.5)
     SL_ATR_MULT = env_float("SL_ATR_MULT", 1.0)
 
-    # Новые пороги для входа по RSI(15M)
+    # === Пороговые значения RSI (по умолчанию как ты описал) ===
+    # BULL: long if rsi <= max; short if rsi > min
+    BULL_LONG_RSI_MAX_5M  = env_float("BULL_LONG_RSI_MAX_5M", 70.0)
     BULL_LONG_RSI_MAX_15M = env_float("BULL_LONG_RSI_MAX_15M", 70.0)
+    BULL_LONG_RSI_MAX_1H  = env_float("BULL_LONG_RSI_MAX_1H", 70.0)
+    BULL_SHORT_RSI_MIN_5M  = env_float("BULL_SHORT_RSI_MIN_5M", 85.0)
     BULL_SHORT_RSI_MIN_15M = env_float("BULL_SHORT_RSI_MIN_15M", 85.0)
+    BULL_SHORT_RSI_MIN_1H  = env_float("BULL_SHORT_RSI_MIN_1H", 85.0)
+
+    # BEAR: short if rsi >= min; long if rsi < max
+    BEAR_SHORT_RSI_MIN_5M  = env_float("BEAR_SHORT_RSI_MIN_5M", 30.0)
     BEAR_SHORT_RSI_MIN_15M = env_float("BEAR_SHORT_RSI_MIN_15M", 30.0)
+    BEAR_SHORT_RSI_MIN_1H  = env_float("BEAR_SHORT_RSI_MIN_1H", 30.0)
+    BEAR_LONG_RSI_MAX_5M  = env_float("BEAR_LONG_RSI_MAX_5M", 15.0)
     BEAR_LONG_RSI_MAX_15M = env_float("BEAR_LONG_RSI_MAX_15M", 15.0)
+    BEAR_LONG_RSI_MAX_1H  = env_float("BEAR_LONG_RSI_MAX_1H", 15.0)
 
     TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "1H,4H,1D"))
     SORT_TF = check_sort_tf(os.getenv("SORT_TF", TIMEFRAMES[0]), TIMEFRAMES)
@@ -231,13 +207,13 @@ def main_loop():
     while True:
         logging.info("=== Новый цикл ===")
         try:
-            # 1) инструменты и мета
+            # 1) инструменты
             instruments = api.get_instruments()
             symbols = [it["symbol"] for it in instruments]
             sym_info = api.build_symbol_info_map(instruments)
             logging.info(f"Всего символов: {len(symbols)}")
 
-            # 2) префильтр по /tickers
+            # 2) префильтр
             tickers = api.get_tickers()
             tick_map = {t["symbol"]: t for t in tickers if t.get("symbol") in symbols}
             if USE_TICKERS_PREFILTER:
@@ -245,10 +221,9 @@ def main_loop():
                 for sym, t in tick_map.items():
                     try:
                         high = float(t.get("highPrice24h") or 0)
-                        low = float(t.get("lowPrice24h") or 0)
+                        low  = float(t.get("lowPrice24h") or 0)
                         last = float(t.get("lastPrice") or 0)
-                        if last <= 0 or high <= 0 or low <= 0:
-                            continue
+                        if last <= 0 or high <= 0 or low <= 0: continue
                         rows.append({"symbol": sym, "range24h_pct": (high - low) / last})
                     except Exception:
                         continue
@@ -288,10 +263,8 @@ def main_loop():
                     last_market = None
                     t = tick_map.get(sym)
                     if t:
-                        try:
-                            last_market = float(t.get("lastPrice"))
-                        except Exception:
-                            pass
+                        try: last_market = float(t.get("lastPrice"))
+                        except Exception: pass
                     last_price = last_market or last_close_for_price or 0.0
 
                     return sym, {
@@ -311,8 +284,7 @@ def main_loop():
             with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                 for f in as_completed([ex.submit(load_pair, s) for s in pre_top]):
                     sym, data = f.result()
-                    if data:
-                        results[sym] = data
+                    if data: results[sym] = data
 
             bull_list, bear_list = [], []
             for sym, d in results.items():
@@ -328,10 +300,8 @@ def main_loop():
                     it[f"atr_pct_{tf}"] = d["atr_pct_map"].get(tf, 0.0)
                     it[f"atr_abs_{tf}"] = d["atr_abs_map"].get(tf, 0.0)
 
-                if d["common_trend"] == "BULL":
-                    bull_list.append(it)
-                elif d["common_trend"] == "BEAR":
-                    bear_list.append(it)
+                if d["common_trend"] == "BULL": bull_list.append(it)
+                elif d["common_trend"] == "BEAR": bear_list.append(it)
 
             bull_list = sorted(bull_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
             bear_list = sorted(bear_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
@@ -339,10 +309,8 @@ def main_loop():
 
             def add_oi(it):
                 sym = it["exchange_symbol"]
-                try:
-                    it["oi"] = api.get_open_interest(sym, "1h") or 0.0
-                except Exception:
-                    it["oi"] = 0.0
+                try: it["oi"] = api.get_open_interest(sym, "1h") or 0.0
+                except Exception: it["oi"] = 0.0
                 return it
 
             with ThreadPoolExecutor(max_workers=min(6, WORKERS)) as ex:
@@ -356,114 +324,107 @@ def main_loop():
             filepath = write_report_file(report_text)
             tg_report.send_document(filepath, caption=f"BYBIT MACD Scanner — отчёт ({' & '.join(TIMEFRAMES)})")
 
-            # ───────────────── Торговый блок ─────────────────
+            # ─────────── Торговый блок ───────────
             if ENABLE_TRADING:
                 private_ok = True
-                try:
-                    _ = api.get_open_positions("BTCUSDT")
+                try: _ = api.get_open_positions("BTCUSDT")
                 except Exception as e:
                     private_ok = False
                     logging.error(f"Приватный API недоступен (торговый блок пропущен): {e}")
 
                 if private_ok:
-                    # считаем все открытые позиции (консервативно блокируем на ошибке)
                     try:
                         current_open_count = api.count_open_positions()
                     except Exception as e:
                         logging.error(f"Не удалось получить список всех открытых позиций: {e}")
-                        current_open_count = MAX_OPEN_POS
+                        current_open_count = MAX_OPEN_POS  # консервативно
 
                     if current_open_count >= MAX_OPEN_POS:
-                        logging.info(f"Достигнут лимит открытых позиций: {current_open_count}/{MAX_OPEN_POS}. Новые входы пропущены.")
+                        logging.info(f"Лимит позиций достигнут: {current_open_count}/{MAX_OPEN_POS}.")
                     else:
-                        # один вход за цикл, предпочтение — списку с большим числом кандидатов
                         prefer_source = "BULL" if len(bull_sorted) >= len(bear_sorted) else "BEAR"
 
                         def cands_bull():
-                            # для LONG логично брать меньшую сумму RSI; для возможного SHORT — высокая сумма RSI
                             return sorted(bull_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES))
-
                         def cands_bear():
-                            # для SHORT логично брать большую сумму RSI; для возможного LONG — низкую
                             return sorted(bear_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
 
                         opened = False
                         for source in [prefer_source, "BEAR" if prefer_source == "BULL" else "BULL"]:
                             cands = cands_bull() if source == "BULL" else cands_bear()
                             for it in cands:
-                                # повторно проверим лимит
-                                try:
-                                    current_open_count = api.count_open_positions()
-                                except Exception:
-                                    current_open_count = MAX_OPEN_POS
+                                try: current_open_count = api.count_open_positions()
+                                except Exception: current_open_count = MAX_OPEN_POS
                                 if current_open_count >= MAX_OPEN_POS:
-                                    logging.info(f"Достигнут лимит открытых позиций: {current_open_count}/{MAX_OPEN_POS}. Останавливаю входы.")
-                                    opened = True
-                                    break
+                                    logging.info(f"Лимит позиций: {current_open_count}/{MAX_OPEN_POS}. Останавливаю входы.")
+                                    opened = True; break
 
                                 sym = it["exchange_symbol"]
                                 info = sym_info.get(sym, {})
 
-                                # нет активной позиции по символу и не было закрытия за 24ч
-                                if api.has_open_position(sym):
-                                    continue
+                                if api.has_open_position(sym): continue
                                 try:
-                                    if api.had_closed_within(sym, 24):
-                                        continue
+                                    if api.had_closed_within(sym, 24): continue
                                 except Exception as e:
                                     logging.warning(f"closed-pnl check failed for {sym}: {e}")
-                                    if os.getenv("COOLDOWN_BLOCK_ON_ERROR", "1").lower() not in ("0", "false"):
-                                        continue
+                                    if os.getenv("COOLDOWN_BLOCK_ON_ERROR", "1").lower() not in ("0","false"): continue
 
                                 last_price = float(it["last_price"])
-                                if last_price <= 0:
-                                    continue
+                                if last_price <= 0: continue
 
-                                # RSI(15M) для правила входа
-                                rsi15 = get_rsi_15m_value(api, it, RSI_PERIOD)
+                                # --- RSI snapshot для 5M/15M/1H ---
+                                rsi_snap = snapshot_rsi(api, sym, RSI_PERIOD)
+                                r5  = rsi_snap.get("5M", 0.0)
+                                r15 = rsi_snap.get("15M", 0.0)
+                                r1h = rsi_snap.get("1H", 0.0)
 
-                                # Определяем сторону входа согласно новым правилам
+                                # --- Правила входа по RSI (AND на 5M/15M/1H) ---
                                 order_side: Optional[str] = None
                                 if source == "BULL":
-                                    if rsi15 <= BULL_LONG_RSI_MAX_15M:
-                                        order_side = "Buy"   # long
-                                    elif rsi15 > BULL_SHORT_RSI_MIN_15M:
-                                        order_side = "Sell"  # short
-                                    else:
-                                        continue
+                                    cond_long  = (r5  <= BULL_LONG_RSI_MAX_5M and
+                                                  r15 <= BULL_LONG_RSI_MAX_15M and
+                                                  r1h <= BULL_LONG_RSI_MAX_1H)
+                                    cond_short = (r5  >  BULL_SHORT_RSI_MIN_5M and
+                                                  r15 >  BULL_SHORT_RSI_MIN_15M and
+                                                  r1h >  BULL_SHORT_RSI_MIN_1H)
+                                    if   cond_long:  order_side = "Buy"
+                                    elif cond_short: order_side = "Sell"
+                                    else:            continue
                                 else:  # source == "BEAR"
-                                    if rsi15 >= BEAR_SHORT_RSI_MIN_15M:
-                                        order_side = "Sell"  # short
-                                    elif rsi15 < BEAR_LONG_RSI_MAX_15M:
-                                        order_side = "Buy"   # long
-                                    else:
-                                        continue
+                                    cond_short = (r5  >= BEAR_SHORT_RSI_MIN_5M and
+                                                  r15 >= BEAR_SHORT_RSI_MIN_15M and
+                                                  r1h >= BEAR_SHORT_RSI_MIN_1H)
+                                    cond_long  = (r5  <  BEAR_LONG_RSI_MAX_5M and
+                                                  r15 <  BEAR_LONG_RSI_MAX_15M and
+                                                  r1h <  BEAR_LONG_RSI_MAX_1H)
+                                    if   cond_short: order_side = "Sell"
+                                    elif cond_long:  order_side = "Buy"
+                                    else:            continue
 
-                                # размер ордера
+                                # размер
                                 try:
                                     usdt_avail = api.get_available_usdt(account_type_env)
                                 except Exception as e:
                                     logging.error(f"Баланс недоступен: {e}")
                                     break
                                 if usdt_avail <= 5:
-                                    logging.info("Недостаточно средств.")
-                                    break
+                                    logging.info("Недостаточно средств."); break
 
                                 notional = min(max(1.0, usdt_avail * ORDER_VALUE_PCT), MAX_ORDER_NOTIONAL_USDT)
                                 qty = api.round_qty(sym, (notional * LEVERAGE) / last_price, info)
-                                if qty <= 0:
-                                    continue
+                                if qty <= 0: continue
 
-                                atr_abs = float(it.get(f"atr_abs_{ATR_TF_FOR_SLTP}", 0.0))
-                                if atr_abs <= 0:
-                                    continue
+                                atr_abs_for_sltp = float(it.get(f"atr_abs_{ATR_TF_FOR_SLTP}", 0.0))
+                                if atr_abs_for_sltp <= 0:
+                                    atr_abs_for_sltp = compute_atr_abs(api, sym, ATR_TF_FOR_SLTP, ATR_PERIOD)
+                                    if atr_abs_for_sltp <= 0: continue
 
                                 if order_side == "Buy":
-                                    raw_tp = last_price + atr_abs * TP_ATR_MULT
-                                    raw_sl = last_price - atr_abs * SL_ATR_MULT
+                                    raw_tp = last_price + atr_abs_for_sltp * TP_ATR_MULT
+                                    raw_sl = last_price - atr_abs_for_sltp * SL_ATR_MULT
                                 else:
-                                    raw_tp = last_price - atr_abs * TP_ATR_MULT
-                                    raw_sl = last_price + atr_abs * SL_ATR_MULT
+                                    raw_tp = last_price - atr_abs_for_sltp * TP_ATR_MULT
+                                    raw_sl = last_price + atr_abs_for_sltp * SL_ATR_MULT
 
                                 tp = api.clamp_price_safe(raw_tp, info)
                                 sl = api.clamp_price_safe(raw_sl, info)
@@ -483,12 +444,17 @@ def main_loop():
                                     logging.error(f"Ошибка создания ордера по {sym}: {e}")
                                     break
 
-                                # --- сообщение в телеграм (ATR% + RSI 5M/15M/1H, форматные TP/SL) ---
-                                atr_pct = (atr_abs / last_price * 100.0) if last_price > 0 else 0.0
-                                rsi_snap = snapshot_rsi(api, sym, RSI_PERIOD)
-                                rsi_5m = rsi_snap.get("5M", 0.0)
-                                rsi_15m = rsi_snap.get("15M", 0.0)
-                                rsi_1h = rsi_snap.get("1H", 0.0)
+                                # --- ATR% для 5M/15M и ТФ SL/TP ---
+                                atr5_abs  = it.get("atr_abs_5M")
+                                atr15_abs = it.get("atr_abs_15M")
+                                if atr5_abs is None:  atr5_abs  = compute_atr_abs(api, sym, "5M",  ATR_PERIOD)
+                                if atr15_abs is None: atr15_abs = compute_atr_abs(api, sym, "15M", ATR_PERIOD)
+                                atr5_pct  = (float(atr5_abs)  / last_price * 100.0) if last_price > 0 else 0.0
+                                atr15_pct = (float(atr15_abs) / last_price * 100.0) if last_price > 0 else 0.0
+                                atr_sltp_pct = (float(atr_abs_for_sltp) / last_price * 100.0) if last_price > 0 else 0.0
+
+                                # --- RSI для сообщения (те же snapshot значения) ---
+                                rsi_5m, rsi_15m, rsi_1h = r5, r15, r1h
 
                                 msg = (
                                     f"🔔 Открыта позиция {sym} {order_side}\n"
@@ -497,29 +463,25 @@ def main_loop():
                                     f"Плечо: x{LEVERAGE}\n"
                                     f"TP: {fmt_tp_sl(tp)}\n"
                                     f"SL: {fmt_tp_sl(sl)}\n"
-                                    f"ATR({ATR_TF_FOR_SLTP})={fmt2(atr_pct)}%\n"
+                                    f"ATR(5M)={fmt2(atr5_pct)}% | ATR(15M)={fmt2(atr15_pct)}% | ATR({ATR_TF_FOR_SLTP})={fmt2(atr_sltp_pct)}%\n"
                                     f"RSI ➜ 5M: {fmt2(rsi_5m)} | 15M: {fmt2(rsi_15m)} | 1H: {fmt2(rsi_1h)}\n"
                                     f"Время: {now_iso()}"
                                 )
 
                                 if tg_trades:
-                                    try:
-                                        tg_trades.send_message(msg)
-                                    except Exception as e:
-                                        logging.error(f"Ошибка sendMessage: {e}")
+                                    try: tg_trades.send_message(msg)
+                                    except Exception as e: logging.error(f"Ошибка sendMessage: {e}")
 
                                 logging.info(f"Открыт ордер {order_id} по {sym} ({order_side}) qty={qty}")
                                 opened = True
                                 break
-                            if opened:
-                                break
+                            if opened: break
 
         except Exception as e:
             logging.exception(f"Фатальная ошибка цикла: {e}")
 
         logging.info(f"Сон на {SCAN_INTERVAL_MINUTES} мин...")
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
-
 
 if __name__ == "__main__":
     main_loop()
