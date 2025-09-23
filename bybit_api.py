@@ -197,15 +197,29 @@ class BybitAPI:
         raise RuntimeError(f"wallet-balance failed: {data}")
 
     def get_available_usdt(self, account_type_env: Optional[str] = None) -> float:
+        """
+        Для UNIFIED/CONTRACT выбираем максимально релевантное поле для деривативной торговли.
+        Предпочтение: availableBalance > availableToWithdraw > walletBalance.
+        """
         res = self.get_wallet_balance(account_type_env or "UNIFIED")
         try:
             lst = res.get("list", [])
-            if not lst: return 0.0
+            if not lst:
+                return 0.0
             for c in lst[0].get("coin", []):
                 if (c.get("coin") or "").upper() == "USDT":
-                    return float(c.get("availableToWithdraw") or c.get("walletBalance") or 0.0)
-        except Exception: pass
+                    # Bybit v5: availableBalance доступен на UNIFIED
+                    for key in ("availableBalance", "availableToWithdraw", "walletBalance"):
+                        v = c.get(key)
+                        if v is not None:
+                            try:
+                                return float(v)
+                            except Exception:
+                                continue
+        except Exception:
+            pass
         return 0.0
+
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     def get_open_positions(
