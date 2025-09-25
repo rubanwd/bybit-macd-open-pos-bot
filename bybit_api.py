@@ -229,7 +229,8 @@ class BybitAPI:
     ) -> List[Dict[str, Any]]:
         """
         Возвращает только активные позиции (size > 0).
-        На демо Bybit иногда требует settleCoin=USDT, поэтому пробуем несколько вариантов.
+        На demo Bybit иногда очень капризный retCode на /v5/position/list.
+        Здесь мы НЕ падаем на неуспехах — логируем и возвращаем [].
         """
         tries: List[Dict[str, Any]] = []
 
@@ -243,21 +244,25 @@ class BybitAPI:
             tries.append({**base, "settleCoin": settle_coin or "USDT"})
             tries.append({**base})
 
-        last_err: Optional[Exception] = None
         for params in tries:
             try:
                 data = self._send("GET", "/v5/position/list", params, private=True)
-                self._req_check(data)
-                self._sleep()
-                lst = data.get("result", {}).get("list", []) or []
-                return [p for p in lst if float(p.get("size", 0) or 0) > 0]
+                rc = int(data.get("retCode", -1))
+                if rc != 0:
+                    # Частые кейсы на demo: 10006 (parameter error), 170244 (unsupported acc),
+                    # 110001 (auth), временные 10002/10005 (system busy)
+                    logging.warning(f"[get_open_positions] retCode={rc} retMsg={data.get('retMsg')} params={params}")
+                    continue
+                lst = (data.get("result") or {}).get("list") or []
+                # фильтруем только открытые
+                return [p for p in lst if float(p.get("size") or 0) > 0]
             except Exception as e:
-                last_err = e
+                logging.warning(f"[get_open_positions] exception with params={params}: {e}")
                 continue
-        # если все попытки не удались — бросаем последнюю ошибку
-        if last_err:
-            raise last_err
+
+        # Все попытки не удались — вернём [] вместо исключения, чтобы не заваливать PnL-чекер
         return []
+
     
     def count_open_positions(self) -> int:
         """

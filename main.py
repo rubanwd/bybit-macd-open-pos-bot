@@ -503,113 +503,168 @@ def main_loop():
         #    Если у тебя в предыдущей версии был подробный вход — оставь его (мы его не меняем здесь).
 
     def do_pnl_check():
+        """
+        Автозакрытие по прибыли:
+        - каждые PNL_CHECK_INTERVAL_MINUTES (внешний планировщик) вызывается этот метод
+        - если PnL% >= CLOSE_ON_PNL_THRESHOLD_PCT:
+            * (опционально) ставим мягкий TP в сторону профита на N тиков и ждём,
+            * если не исполнилось — маркет reduceOnly.
+        Устойчив к временным ошибкам /v5/position/list: просто пропускает цикл с логом.
+        """
         if not (ENABLE_TRADING and CLOSE_ON_PNL_ENABLED):
+            logging.debug("PNL-чекер: выключен (ENABLE_TRADING=0 или CLOSE_ON_PNL_ENABLED=0).")
             return
 
-        # Нужен tickSize для «мягкого» TP — построим карту
+        # 1) Загружаем инструменты для получения tickSize (нужно для мягкого TP).
         try:
             instruments = api.get_instruments()
             sym_info = api.build_symbol_info_map(instruments)
-        except Exception:
+        except Exception as e:
+            logging.warning(f"PNL-чекер: не удалось получить инструменты (tickSize), продолжу без них: {e}")
             sym_info = {}
 
-        # Получим открытые позиции
+        # 2) Открытые позиции (метод в bybit_api уже «мягкий» и может вернуть []).
         try:
             positions = api.get_open_positions(symbol=None, settle_coin="USDT")
         except Exception as e:
-            logging.error(f"PNL-чекер: не удалось получить открытые позиции: {e}")
-            return
-        if not positions:
-            logging.info("PNL-чекер: открытых позиций нет.")
+            logging.error(f"PNL-чекер: исключение при get_open_positions: {e}")
             return
 
-        # Фолбэк цены
-        tick_last = {}
+        if not positions:
+            logging.info("PNL-чекер: открытых позиций нет (или приватный API вернул пусто).")
+            return
+
+        # 3) Фолбэк-цены по lastPrice (если у позиции нет markPrice).
+        tick_last: Dict[str, float] = {}
         try:
             for t in api.get_tickers():
                 sym = t.get("symbol")
-                if sym:
-                    try:
-                        tick_last[sym] = float(t.get("lastPrice") or 0)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                if not sym:
+                    continue
+                try:
+                    tick_last[sym] = float(t.get("lastPrice") or 0.0)
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.warning(f"PNL-чекер: не удалось получить lastPrice тиков: {e}")
 
+        # 4) Обход позиций
         for p in positions:
             try:
                 sym = p.get("symbol")
-                side = p.get("side")  # "Buy"/"Sell"
-                size = float(p.get("size") or 0)
-                if size <= 0:
-                    continue
-                avg_price = float(p.get("avgPrice") or 0)
-                mark_price = None
-                try:
-                    mark_price = float(p.get("markPrice") or 0)
-                except Exception:
-                    mark_price = None
-                if not mark_price or mark_price <= 0:
-                    mark_price = tick_last.get(sym, 0.0)
-                if avg_price <= 0 or mark_price <= 0:
+                side = (p.get("side") or "").strip()  # 'Buy'/'Sell'
+                if not sym or side.lower() not in ("buy", "sell"):
                     continue
 
-                if str(side).lower() == "buy":
+                # В hedge-режиме Bybit может прислать две записи по одному символу (лонг/шорт) — это ок.
+                size = float(p.get("size") or 0.0)
+                if size <= 0:
+                    continue
+
+                avg_price = float(p.get("avgPrice") or 0.0)
+                # markPrice может не прийти (или =0) — используем lastPrice из tikers
+                try:
+                    mark_price = float(p.get("markPrice") or 0.0)
+                except Exception:
+                    mark_price = 0.0
+                if mark_price <= 0:
+                    mark_price = float(tick_last.get(sym, 0.0))
+
+                if avg_price <= 0 or mark_price <= 0:
+                    logging.debug(f"PNL-чекер: пропуск {sym} — avg_price={avg_price}, mark_price={mark_price}.")
+                    continue
+
+                # 5) PnL% как процент движения цены (без плеча)
+                if side.lower() == "buy":
                     pnl_pct = (mark_price - avg_price) / avg_price * 100.0
                 else:
                     pnl_pct = (avg_price - mark_price) / avg_price * 100.0
 
-                if pnl_pct >= CLOSE_ON_PNL_THRESHOLD_PCT:
-                    # --- «мягкое» закрытие ---
-                    if SOFT_CLOSE_ENABLED:
-                        info = sym_info.get(sym, {})
-                        tick = float(info.get("tickSize", 0.01)) if info else 0.01
-                        # TP в сторону профита на 1–2 тика от текущей цены:
-                        if str(side).lower() == "buy":
-                            tp_price = mark_price + SOFT_CLOSE_TICKS * tick  # для LONG TP сработает при тик-апе
-                        else:
-                            tp_price = mark_price - SOFT_CLOSE_TICKS * tick  # для SHORT TP сработает при тик-дауне
-                        try:
-                            api.set_take_profit_only(sym, side, tp_price)
-                            logging.info(f"PNL-чекер: soft-TP для {sym} {side} @ {tp_price}")
-                        except Exception as e:
-                            logging.warning(f"PNL-чекер: не удалось выставить soft-TP: {e}")
+                logging.info(f"PNL-чекер: {sym} {side} size={size} avg={avg_price:.8f} mark={mark_price:.8f} pnl%={pnl_pct:.2f}")
 
-                        # ждём «догрызания» 1–2 тиков
-                        waited = 0
-                        closed = False
-                        while waited < SOFT_CLOSE_WAIT_SECONDS:
-                            time.sleep(SOFT_CLOSE_POLL_INTERVAL_SEC)
-                            waited += SOFT_CLOSE_POLL_INTERVAL_SEC
-                            try:
-                                pos_now = api.get_open_positions(symbol=sym)
-                                # если позиции нет — считаем закрытой
-                                if not pos_now or float(pos_now[0].get("size") or 0) <= 0:
-                                    closed = True
-                                    logging.info(f"PNL-чекер: {sym} закрылась по soft-TP.")
-                                    break
-                            except Exception:
-                                # в сомнительных случаях просто продолжим до фолбэка
-                                pass
+                if pnl_pct < CLOSE_ON_PNL_THRESHOLD_PCT:
+                    continue  # порог не достигнут
 
-                        if closed:
-                            try:
-                                if tg_trades:
-                                    tg_trades.send_message(f"✅ Закрыта (soft-TP) {sym} {side}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}")
-                            except Exception:
-                                pass
-                            continue  # к следующей позиции
+                # === достигли порога прибыли ===
 
-                    # --- фолбэк: маркет reduceOnly на весь объём ---
+                # 6) Мягкое закрытие: выставляем TP поблизости и ждём N секунд
+                if SOFT_CLOSE_ENABLED:
+                    info = sym_info.get(sym, {})
+                    tick = float(info.get("tickSize", 0.0)) if info else 0.0
+                    if tick <= 0:
+                        # запасной вариант, если нет меты по тик-сайзу
+                        tick = 0.01
+
+                    ticks = max(1, int(SOFT_CLOSE_TICKS))
+                    if side.lower() == "buy":
+                        tp_price = mark_price + ticks * tick    # для LONG — ждём тик вверх
+                    else:
+                        tp_price = mark_price - ticks * tick    # для SHORT — ждём тик вниз
+
+                    # нормализуем цену под шаг тика
                     try:
-                        order_id = api.close_position_market(sym, side, size)
-                        logging.info(f"PNL-чекер: {sym} {side} size={size} закрыта MARKET (PnL={pnl_pct:.2f}%). order_id={order_id}")
-                        if tg_trades:
-                            tg_trades.send_message(f"✅ Закрыта (market) {sym} {side} size={size}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}")
+                        tp_price = api.clamp_price_safe(tp_price, info)
+                    except Exception:
+                        pass
+
+                    try:
+                        api.set_take_profit_only(sym, side, tp_price)
+                        logging.info(f"PNL-чекер: выставлен soft-TP {sym} {side} @ {tp_price}")
                     except Exception as e:
-                        logging.error(f"PNL-чекер: не удалось закрыть {sym} маркетом: {e}")
+                        logging.warning(f"PNL-чекер: не удалось выставить soft-TP для {sym}: {e}")
+
+                    # ждём исполнения TP
+                    waited = 0
+                    closed_by_soft = False
+                    while waited < SOFT_CLOSE_WAIT_SECONDS:
+                        time.sleep(max(1, int(SOFT_CLOSE_POLL_INTERVAL_SEC)))
+                        waited += max(1, int(SOFT_CLOSE_POLL_INTERVAL_SEC))
+                        try:
+                            # если позиции нет или объём 0 — считаем закрытой
+                            pos_now = api.get_open_positions(symbol=sym)
+                            has_size = False
+                            for pp in (pos_now or []):
+                                if (pp.get("symbol") == sym) and ((pp.get("side") or "").lower() == side.lower()):
+                                    if float(pp.get("size") or 0.0) > 0.0:
+                                        has_size = True
+                                        break
+                            if not has_size:
+                                closed_by_soft = True
+                                logging.info(f"PNL-чекер: {sym} закрылась по soft-TP.")
+                                break
+                        except Exception as e:
+                            logging.debug(f"PNL-чекер: опрос позиции {sym} после soft-TP не удался: {e}")
+                            # продолжаем ждать до фолбэка
+
+                    if closed_by_soft:
+                        try:
+                            if tg_trades:
+                                tg_trades.send_message(
+                                    f"✅ Закрыта (soft-TP) {sym} {side}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}"
+                                )
+                        except Exception:
+                            pass
+                        continue  # к следующей позиции
+
+                # 7) Фолбэк: закрываем маркетом reduceOnly на весь объём
+                try:
+                    order_id = api.close_position_market(sym, side, size)
+                    logging.info(
+                        f"PNL-чекер: {sym} {side} size={size} закрыта MARKET (PnL={pnl_pct:.2f}%). order_id={order_id}"
+                    )
+                    try:
+                        if tg_trades:
+                            tg_trades.send_message(
+                                f"✅ Закрыта (market) {sym} {side} size={size}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}"
+                            )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logging.error(f"PNL-чекер: не удалось закрыть {sym} маркетом: {e}")
+
             except Exception as e:
-                logging.error(f"PNL-чекер: ошибка по позиции: {e}")
+                logging.error(f"PNL-чекер: ошибка обработки позиции: {e}")
+
 
     # планирование
     scan_every = timedelta(minutes=SCAN_INTERVAL_MINUTES)
