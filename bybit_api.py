@@ -208,7 +208,6 @@ class BybitAPI:
                 return 0.0
             for c in lst[0].get("coin", []):
                 if (c.get("coin") or "").upper() == "USDT":
-                    # Bybit v5: availableBalance доступен на UNIFIED
                     for key in ("availableBalance", "availableToWithdraw", "walletBalance"):
                         v = c.get(key)
                         if v is not None:
@@ -219,6 +218,7 @@ class BybitAPI:
         except Exception:
             pass
         return 0.0
+
 
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
@@ -368,3 +368,108 @@ class BybitAPI:
         try: return len(self.get_closed_pnl(symbol, start_ms, end_ms)) > 0
         except Exception as e:
             logging.warning(f"closed-pnl check failed for {symbol}: {e}"); return False
+
+    # === bybit_api.py: ДОБАВИТЬ новый метод для рыночного закрытия позиции (reduceOnly) ===
+    def close_position_market(self, symbol: str, current_side: str, qty: float) -> str:
+        """
+        Закрытие позиции рыночным reduceOnly-ордером на полный объём.
+        current_side: "Buy" (лонг) или "Sell" (шорт) — именно СТОРОНА ТЕКУЩЕЙ ПОЗИЦИИ.
+        """
+        if qty <= 0:
+            raise RuntimeError(f"close_position_market: qty<=0 for {symbol}")
+        # Противоположная сторона для ордера
+        order_side = "Sell" if str(current_side).lower() == "buy" else "Buy"
+
+        # positionIdx должен соответствовать СТОРОНЕ текущей позиции в hedge-режиме
+        mode = self._detect_mode(symbol)
+        if mode == "hedge":
+            position_idx = 1 if str(current_side).lower() == "buy" else 2
+        else:
+            position_idx = 0
+
+        body = {
+            "category": self.category,
+            "symbol": symbol,
+            "side": order_side,
+            "orderType": "Market",
+            "qty": str(qty),
+            "reduceOnly": True,
+            "positionIdx": position_idx,
+        }
+        data = self._send("POST", "/v5/order/create", body, private=True)
+        self._req_check(data)
+        self._sleep()
+        return (data.get("result") or {}).get("orderId", "")
+
+
+    def create_limit_reduce_only(self, symbol: str, current_side: str, qty: float, price: float) -> str:
+        """
+        Пытаемся закрыть позицию лимитным reduceOnly-ордером c IOC (мягкое закрытие).
+        current_side: "Buy" (лонг) или "Sell" (шорт) — СТОРОНА ТЕКУЩЕЙ ПОЗИЦИИ.
+        """
+        if qty <= 0:
+            raise RuntimeError(f"create_limit_reduce_only: qty<=0 for {symbol}")
+        order_side = "Sell" if str(current_side).lower() == "buy" else "Buy"
+        mode = self._detect_mode(symbol)
+        position_idx = 1 if (mode == "hedge" and str(current_side).lower() == "buy") else (2 if mode == "hedge" else 0)
+
+        body = {
+            "category": self.category,
+            "symbol": symbol,
+            "side": order_side,
+            "orderType": "Limit",
+            "timeInForce": "IOC",
+            "reduceOnly": True,
+            "qty": str(qty),
+            "price": str(price),
+            "positionIdx": position_idx,
+        }
+        data = self._send("POST", "/v5/order/create", body, private=True)
+        self._req_check(data)
+        self._sleep()
+        return (data.get("result") or {}).get("orderId", "")
+
+
+    def close_position_market(self, symbol: str, current_side: str, qty: float) -> str:
+        """
+        Жёсткое закрытие позиции маркетом reduceOnly (фолбэк).
+        current_side: "Buy" (лонг) или "Sell" (шорт) — СТОРОНА ТЕКУЩЕЙ ПОЗИЦИИ.
+        """
+        if qty <= 0:
+            raise RuntimeError(f"close_position_market: qty<=0 for {symbol}")
+        order_side = "Sell" if str(current_side).lower() == "buy" else "Buy"
+        mode = self._detect_mode(symbol)
+        position_idx = 1 if (mode == "hedge" and str(current_side).lower() == "buy") else (2 if mode == "hedge" else 0)
+
+        body = {
+            "category": self.category,
+            "symbol": symbol,
+            "side": order_side,
+            "orderType": "Market",
+            "qty": str(qty),
+            "reduceOnly": True,
+            "positionIdx": position_idx,
+        }
+        data = self._send("POST", "/v5/order/create", body, private=True)
+        self._req_check(data)
+        self._sleep()
+        return (data.get("result") or {}).get("orderId", "")
+    
+
+    def set_take_profit_only(self, symbol: str, side: str, take_profit: float):
+        """
+        Обновляет TP только для указанной стороны позиции. side: 'Buy'|'Sell' (сторона ПОЗИЦИИ).
+        """
+        order_side = "Buy" if side.lower() == "buy" else "Sell"
+        position_idx = self._position_idx(symbol, order_side)
+        body = {
+            "category": self.category,
+            "symbol": symbol,
+            "positionIdx": position_idx,
+            "takeProfit": str(take_profit),
+            "tpTriggerBy": "LastPrice",
+        }
+        data = self._send("POST", "/v5/position/trading-stop", body, private=True)
+        self._req_check(data)
+        self._sleep()
+

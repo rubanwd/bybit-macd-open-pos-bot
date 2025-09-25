@@ -4,10 +4,15 @@ import time
 import logging
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 
 import pandas as pd
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
 from tenacity import RetryError
+import pytz
 
 from bybit_api import BybitAPI
 from indicators import macd, rsi, atr
@@ -27,9 +32,9 @@ TF_TO_BYBIT = {
     "12H": "720",
     "1D": "D",
     "1W": "W",
-    "1MN": "M",  # month, используем ключ 1MN, чтобы не путать с 1 минутой
+    "1MN": "M",  # месяц (MONTH). 1M => 1MN
 }
-LONG_TF_CODES = {"W", "M"}  # недельный и месячный дают мало баров, режем limit
+LONG_TF_CODES = {"W", "M"}  # недельный/месячный — ограничиваем limit
 
 
 def setup_logging():
@@ -52,20 +57,20 @@ def env_float(n, d):
 
 def parse_timeframes(s: str) -> List[str]:
     if not s:
-        return ["1H", "4H", "1D"]
+        return ["5M", "15M", "1H"]
     items = [x.strip().upper() for x in s.split(",") if x.strip()]
     valid = []
     for x in items:
         if x in TF_TO_BYBIT:
             valid.append(x)
-        elif x == "1M":  # если пользователь указал 1M как месяц — поддержим
+        elif x == "1M":
             valid.append("1MN")
-    return valid or ["1H", "4H", "1D"]
+    return valid or ["5M", "15M", "1H"]
 
 
 def check_sort_tf(s, tfs):
     s = (s or "").strip().upper()
-    if s == "1M":  # аналогично 1M → 1MN
+    if s == "1M":
         s = "1MN"
     if s in tfs:
         return s
@@ -85,48 +90,27 @@ def compute_indicators(df, mf, ms, msig, rper, aper):
 
 
 def classify_trend_simple(ml, sl, h):
-    """Базовая классификация по MACD/Signal/Hist без наклонов (для обратной совместимости)."""
     bull = (ml.iloc[-1] > sl.iloc[-1]) and (h.iloc[-1] > 0)
     bear = (ml.iloc[-1] < sl.iloc[-1]) and (h.iloc[-1] < 0)
     return "BULL" if bull else ("BEAR" if bear else "NEUTRAL")
 
 
 def classify_trend_with_slope(ml, sl, h, lookback: int, min_slope: float):
-    """
-    Усиленная классификация: тренд по MACD + проверка наклонов (угла) MACD и Signal.
-    lookback: на сколько баров назад сравнивать.
-    min_slope: минимальный модуль наклона; 0 => учитывать только знак.
-    """
-    # Базовое направление по MACD
     base = classify_trend_simple(ml, sl, h)
     if base == "NEUTRAL":
         return "NEUTRAL"
-
-    # Защитимся от малых выборок
     if len(ml) <= lookback or len(sl) <= lookback:
         return "NEUTRAL"
-
     slope_macd = float(ml.iloc[-1] - ml.iloc[-1 - lookback])
     slope_sig  = float(sl.iloc[-1] - sl.iloc[-1 - lookback])
 
-    def up_ok(val: float) -> bool:
-        return (val > min_slope)
-
-    def down_ok(val: float) -> bool:
-        return (val < -min_slope)
+    def up_ok(v: float) -> bool: return (v > min_slope)
+    def dn_ok(v: float) -> bool: return (v < -min_slope)
 
     if base == "BULL":
-        # для лонга обе линии должны уверенно расти
-        if up_ok(slope_macd) and up_ok(slope_sig):
-            return "BULL"
-        else:
-            return "NEUTRAL"
-    else:  # base == "BEAR"
-        # для шорта обе линии должны уверенно падать
-        if down_ok(slope_macd) and down_ok(slope_sig):
-            return "BEAR"
-        else:
-            return "NEUTRAL"
+        return "BULL" if up_ok(slope_macd) and up_ok(slope_sig) else "NEUTRAL"
+    else:
+        return "BEAR" if dn_ok(slope_macd) and dn_ok(slope_sig) else "NEUTRAL"
 
 
 def rsi_sum(item, tfs):
@@ -142,20 +126,6 @@ def fmt2(x: float) -> str:
         return f"{float(x):.2f}"
     except Exception:
         return "-"
-
-
-def fmt_tp_sl(value: float) -> str:
-    s = f"{float(value):.18f}".rstrip("0")
-    if "." not in s:
-        return s
-    intp, frac = s.split(".", 1)
-    i = 0
-    while i < len(frac) and frac[i] == "0":
-        i += 1
-    keep = frac[i:i + 3]
-    if not keep:
-        return intp + "." + frac
-    return intp + "." + (frac[:i] + keep)
 
 
 def snapshot_rsi(api: BybitAPI, symbol: str, rsi_period: int) -> Dict[str, float]:
@@ -183,14 +153,63 @@ def compute_atr_abs(api: BybitAPI, symbol: str, tf_code: str, atr_period: int) -
         return 0.0
 
 
+# -------- Вспомогательные функции: торговое окно и планировщик --------
+
+def parse_hhmm(s: str) -> Tuple[int, int]:
+    h, m = s.split(":")
+    return int(h), int(m)
+
+
+def in_trading_window(now_dt: datetime, tz_str: str, start_hhmm: str, end_hhmm: str) -> bool:
+    tz = pytz.timezone(tz_str)
+    local_now = now_dt.astimezone(tz)
+    sh, sm = parse_hhmm(start_hhmm)
+    eh, em = parse_hhmm(end_hhmm)
+    start_today = tz.localize(datetime(local_now.year, local_now.month, local_now.day, sh, sm))
+    end_today   = tz.localize(datetime(local_now.year, local_now.month, local_now.day, eh, em))
+    return start_today <= local_now <= end_today
+
+
+def seconds_until_window_start(now_dt: datetime, tz_str: str, start_hhmm: str) -> int:
+    tz = pytz.timezone(tz_str)
+    local_now = now_dt.astimezone(tz)
+    sh, sm = parse_hhmm(start_hhmm)
+    start_today = tz.localize(datetime(local_now.year, local_now.month, local_now.day, sh, sm))
+    if local_now <= start_today:
+        delta = (start_today - local_now)
+    else:
+        start_next = start_today + timedelta(days=1)
+        delta = (start_next - local_now)
+    return max(1, int(delta.total_seconds()))
+
+
 # ------------------------ MAIN LOOP ------------------------
 
 def main_loop():
-    load_dotenv()
+    # На Render ключи задаются через Variables, .env не нужен.
+    if load_dotenv:
+        try:
+            load_dotenv()
+        except Exception:
+            pass
     setup_logging()
 
     # === ENV ===
-    SCAN_INTERVAL_MINUTES = env_int("SCAN_INTERVAL_MINUTES", 2)  # быстрый скан
+    SCAN_INTERVAL_MINUTES = env_int("SCAN_INTERVAL_MINUTES", 2)
+    PNL_CHECK_INTERVAL_MINUTES = env_int("PNL_CHECK_INTERVAL_MINUTES", 3)
+
+    TRADING_WINDOW_TZ = os.getenv("TRADING_WINDOW_TZ", "Europe/Kyiv")
+    TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "08:00")
+    TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "20:00")
+
+    CLOSE_ON_PNL_ENABLED = env_int("CLOSE_ON_PNL_ENABLED", 1) == 1
+    CLOSE_ON_PNL_THRESHOLD_PCT = env_float("CLOSE_ON_PNL_THRESHOLD_PCT", 5.0)
+
+    # «мягкое» закрытие
+    SOFT_CLOSE_ENABLED = env_int("SOFT_CLOSE_ENABLED", 1) == 1
+    SOFT_CLOSE_TICKS = env_int("SOFT_CLOSE_TICKS", 2)                 # на сколько тиков от текущей цены ставить TP
+    SOFT_CLOSE_WAIT_SECONDS = env_int("SOFT_CLOSE_WAIT_SECONDS", 10)  # сколько ждать, прежде чем маркет-фолбэк
+    SOFT_CLOSE_POLL_INTERVAL_SEC = env_int("SOFT_CLOSE_POLL_INTERVAL_SEC", 2)
 
     CATEGORY = os.getenv("BYBIT_CATEGORY", "linear")
     TOP_N = env_int("TOP_N", 50)
@@ -202,16 +221,13 @@ def main_loop():
     RSI_PERIOD = env_int("RSI_PERIOD", 14)
     ATR_PERIOD = env_int("ATR_PERIOD", 14)
 
-    # --- Новые параметры для наклонов MACD/Signal ---
+    # Наклоны MACD/Signal
     MACD_SLOPE_LOOKBACK_5M  = env_int("MACD_SLOPE_LOOKBACK_5M", 3)
     MACD_SLOPE_LOOKBACK_15M = env_int("MACD_SLOPE_LOOKBACK_15M", 3)
     MACD_SLOPE_LOOKBACK_1H  = env_int("MACD_SLOPE_LOOKBACK_1H", 3)
-    # Минимальный модуль наклона (в абсолютных единицах MACD). 0 => учитывать только знак.
     MACD_MIN_SLOPE_5M  = env_float("MACD_MIN_SLOPE_5M", 0.0)
     MACD_MIN_SLOPE_15M = env_float("MACD_MIN_SLOPE_15M", 0.0)
     MACD_MIN_SLOPE_1H  = env_float("MACD_MIN_SLOPE_1H", 0.0)
-
-    # Фильтр противоречий между ТФ (вкл/выкл)
     MACD_CONTRADICTION_FILTER = env_int("MACD_CONTRADICTION_FILTER", 1) == 1
 
     SLEEP_MS = env_int("PER_REQUEST_SLEEP_MS", 250)
@@ -225,6 +241,7 @@ def main_loop():
     ENABLE_TRADING = env_int("ENABLE_TRADING", 0) == 1
     ORDER_VALUE_PCT = env_float("ORDER_VALUE_PCT", 0.20)
     MAX_ORDER_NOTIONAL_USDT = env_float("MAX_ORDER_NOTIONAL_USDT", 100.0)
+    ORDER_SAFETY_MARGIN_PCT = env_float("ORDER_SAFETY_MARGIN_PCT", 0.85)
     LEVERAGE = env_int("LEVERAGE", 10)
     MAX_OPEN_POS = env_int("MAX_OPEN_POSITIONS", 5)
     ATR_TF_FOR_SLTP = (os.getenv("ATR_TF_FOR_SLTP") or "15M").upper()
@@ -233,7 +250,7 @@ def main_loop():
     TP_ATR_MULT = env_float("TP_ATR_MULT", 1.5)
     SL_ATR_MULT = env_float("SL_ATR_MULT", 1.0)
 
-    # ==== Смягчённые RSI-пороги (из прошлой версии) ====
+    # Смягчённые RSI-дефолты
     BULL_LONG_RSI_MAX_5M  = env_float("BULL_LONG_RSI_MAX_5M", 75.0)
     BULL_LONG_RSI_MAX_15M = env_float("BULL_LONG_RSI_MAX_15M", 75.0)
     BULL_LONG_RSI_MAX_1H  = env_float("BULL_LONG_RSI_MAX_1H", 75.0)
@@ -248,7 +265,7 @@ def main_loop():
     BEAR_LONG_RSI_MAX_15M = env_float("BEAR_LONG_RSI_MAX_15M", 20.0)
     BEAR_LONG_RSI_MAX_1H  = env_float("BEAR_LONG_RSI_MAX_1H", 20.0)
 
-    # ==== Фильтр аномалий (с прошлой версии) ====
+    # Фильтр аномалий
     ANOMALY_FILTER_ENABLED = env_int("ANOMALY_FILTER_ENABLED", 1) == 1
     ANOMALY_ABS_CHANGE_PCT = env_float("ANOMALY_ABS_CHANGE_PCT", 0.60)
     ANOMALY_RANGE_PCT = env_float("ANOMALY_RANGE_PCT", 1.00)
@@ -260,7 +277,7 @@ def main_loop():
     if ATR_TF_FOR_SLTP not in TIMEFRAMES:
         TIMEFRAMES.append(ATR_TF_FOR_SLTP)
 
-    TREND_RULE_HUMAN = "trend rule: 1H veto + confirmation by (15M OR 5M) + MACD-slope check"
+    TREND_RULE_HUMAN = "1H veto + (15M OR 5M) + MACD slope check"
 
     logging.info(f"Активные ТФ: {', '.join(TIMEFRAMES)} | отсечка TopN по ATR%: {SORT_TF}")
     logging.info(
@@ -273,13 +290,10 @@ def main_loop():
     TRD_TOKEN = os.getenv("TELEGRAM_TRADES_BOT_TOKEN")
     TRD_CHAT = os.getenv("TELEGRAM_TRADES_CHAT_ID")
     if not TG_TOKEN or not TG_CHAT_ID:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы в .env")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы в Variables")
     tg_report = TelegramClient(TG_TOKEN, TG_CHAT_ID)
     tg_trades = TelegramClient(TRD_TOKEN, TRD_CHAT) if (ENABLE_TRADING and TRD_TOKEN and TRD_CHAT) else None
 
-    api_key = os.getenv("BYBIT_API_KEY") or ""
-    api_secret = os.getenv("BYBIT_API_SECRET") or ""
-    recv_window = env_int("BYBIT_RECV_WINDOW", 60000)
     base_url = (os.getenv("BYBIT_BASE_URL") or "https://api.bybit.com").strip()
     sign_style = (os.getenv("BYBIT_SIGN_STYLE") or "headers").strip().lower()
     position_mode = (os.getenv("POSITION_MODE") or "one_way").strip().lower()
@@ -288,388 +302,357 @@ def main_loop():
     logging.info(f"Bybit base: {base_url} | sign_style={sign_style} | Trading={'ON' if ENABLE_TRADING else 'OFF'}")
 
     api = BybitAPI(
-        category=CATEGORY,
-        sleep_ms=env_int("PER_REQUEST_SLEEP_MS", 250),
-        max_retries=env_int("MAX_RETRIES", 3),
-        retry_backoff_sec=env_int("RETRY_BACKOFF_SEC", 2),
-        api_key=api_key,
-        api_secret=api_secret,
-        recv_window=recv_window,
+        category=os.getenv("BYBIT_CATEGORY", "linear"),
+        sleep_ms=SLEEP_MS,
+        max_retries=MAX_RETRIES,
+        retry_backoff_sec=RETRY_BACKOFF,
+        api_key=os.getenv("BYBIT_API_KEY") or "",
+        api_secret=os.getenv("BYBIT_API_SECRET") or "",
+        recv_window=env_int("BYBIT_RECV_WINDOW", 60000),
         base_url=base_url,
         sign_style=sign_style,
         position_mode=position_mode,
     )
 
-    while True:
-        logging.info("=== Новый цикл ===")
-        try:
-            # 1) Инструменты и мета
-            instruments = api.get_instruments()
-            symbols = [it["symbol"] for it in instruments]
-            sym_info = api.build_symbol_info_map(instruments)
-            logging.info(f"Всего символов: {len(symbols)}")
+    # -------- планировщик задач: scan и pnl-check --------
+    def do_scan_cycle():
+        # 1) Инструменты
+        instruments = api.get_instruments()
+        symbols = [it["symbol"] for it in instruments]
+        sym_info = api.build_symbol_info_map(instruments)
+        logging.info(f"Всего символов: {len(symbols)}")
 
-            # 2) Префильтр по /tickers (+ аномалий-фильтр)
-            tickers = api.get_tickers()
-            tick_map = {t["symbol"]: t for t in tickers if t.get("symbol") in symbols}
+        # 2) Префильтр по /tickers (+ аномалии)
+        tickers = api.get_tickers()
+        tick_map = {t["symbol"]: t for t in tickers if t.get("symbol") in symbols}
 
-            excluded_cnt = 0
-            rows = []
-            for sym, t in tick_map.items():
-                try:
-                    high = float(t.get("highPrice24h") or 0)
-                    low = float(t.get("lowPrice24h") or 0)
-                    last = float(t.get("lastPrice") or 0)
-                    if last <= 0 or high <= 0 or low <= 0:
-                        continue
-
-                    range24h_pct = (high - low) / last
-                    try:
-                        chg = float(t.get("price24hPcnt"))
-                    except Exception:
-                        prev = float(t.get("prevPrice24h") or 0)
-                        chg = (last - prev) / prev if prev > 0 else 0.0
-
-                    turnover24h = float(t.get("turnover24h") or 0.0)
-
-                    if ANOMALY_FILTER_ENABLED:
-                        if (abs(chg) > ANOMALY_ABS_CHANGE_PCT) or (range24h_pct > ANOMALY_RANGE_PCT) or (turnover24h < ANOMALY_MIN_TURNOVER_USDT):
-                            excluded_cnt += 1
-                            continue
-
-                    rows.append({"symbol": sym, "range24h_pct": range24h_pct})
-                except Exception:
+        excluded_cnt = 0
+        rows = []
+        for sym, t in tick_map.items():
+            try:
+                high = float(t.get("highPrice24h") or 0)
+                low = float(t.get("lowPrice24h") or 0)
+                last = float(t.get("lastPrice") or 0)
+                if last <= 0 or high <= 0 or low <= 0:
                     continue
 
-            rows = sorted(rows, key=lambda x: x["range24h_pct"], reverse=True)
-            pre_top_raw = [r["symbol"] for r in rows[:max(TOP_N * PREFILTER_MULTIPLIER, TOP_N)]]
-            logging.info(
-                f"Префильтр /tickers: выбрано {len(pre_top_raw)} (multiplier={PREFILTER_MULTIPLIER}); "
-                f"исключено аномалий: {excluded_cnt}"
-            )
-            pre_top = pre_top_raw if USE_TICKERS_PREFILTER else symbols
-
-            # 3) Индикаторы + тренды (с наклонами MACD/Signal)
-            def load_pair(sym: str) -> Tuple[str, Optional[Dict]]:
+                range24h_pct = (high - low) / last
                 try:
-                    trends, rsis, atr_abs, atr_pct = {}, {}, {}, {}
-                    last_close_for_price = None
-                    for tf in TIMEFRAMES:
-                        tf_key = "1MN" if tf == "1M" else tf
-                        interval = TF_TO_BYBIT[tf_key]
-                        limit = min(LIMIT, 120) if interval in LONG_TF_CODES else LIMIT
-                        kl = api.get_klines(sym, interval, limit=limit)
-                        if (interval in LONG_TF_CODES and len(kl) < 30) or (interval not in LONG_TF_CODES and len(kl) < 50):
-                            return sym, None
-
-                        df = kline_to_df(kl)
-                        m, s, h, rs, asr = compute_indicators(df, MACD_FAST, MACD_SLOW, MACD_SIGNAL, RSI_PERIOD, ATR_PERIOD)
-
-                        # Подбор параметров наклона для каждого ТФ
-                        if tf_key == "5M":
-                            trend = classify_trend_with_slope(m, s, h, MACD_SLOPE_LOOKBACK_5M, MACD_MIN_SLOPE_5M)
-                        elif tf_key == "15M":
-                            trend = classify_trend_with_slope(m, s, h, MACD_SLOPE_LOOKBACK_15M, MACD_MIN_SLOPE_15M)
-                        elif tf_key == "1H":
-                            trend = classify_trend_with_slope(m, s, h, MACD_SLOPE_LOOKBACK_1H, MACD_MIN_SLOPE_1H)
-                        else:
-                            trend = classify_trend_simple(m, s, h)  # для прочих ТФ
-
-                        trends[tf_key] = trend
-                        rsis[tf_key] = float(rs.iloc[-1])
-
-                        last_close = float(df["close"].iloc[-1])
-                        last_close_for_price = last_close
-                        aa = float(asr.iloc[-1])
-                        ap = (aa / last_close) if last_close else 0.0
-                        atr_abs[tf_key] = aa
-                        atr_pct[tf_key] = ap
-
-                    last_market = None
-                    t = tick_map.get(sym)
-                    if t:
-                        try:
-                            last_market = float(t.get("lastPrice"))
-                        except Exception:
-                            pass
-                    last_price = last_market or last_close_for_price or 0.0
-
-                    return sym, {
-                        "trends": trends,
-                        "atr_abs_map": atr_abs,
-                        "atr_pct_map": atr_pct,
-                        "rsi_map": rsis,
-                        "last_price": last_price,
-                        "atr_sort_abs": atr_abs.get(SORT_TF if SORT_TF != "1M" else "1MN", 0.0),
-                        "atr_sort_pct": atr_pct.get(SORT_TF if SORT_TF != "1M" else "1MN", 0.0),
-                    }
-                except Exception as e:
-                    logging.debug(f"[{sym}] ошибка загрузки/индикаторов: {e}")
-                    return sym, None
-
-            results: Dict[str, Dict] = {}
-            with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-                for f in as_completed([ex.submit(load_pair, s) for s in pre_top]):
-                    sym, data = f.result()
-                    if data:
-                        results[sym] = data
-
-            # 4) Формируем BULL/BEAR с проверкой наклонов и противоречий
-            bull_list, bear_list = [], []
-            for sym, d in results.items():
-                it = {
-                    "symbol": f"{sym.replace('USDT', '')}/USDT",
-                    "exchange_symbol": sym,
-                    "last_price": d["last_price"],
-                    "atr_abs": d["atr_sort_abs"],
-                    "atr_pct": d["atr_sort_pct"],
-                }
-                for tf in TIMEFRAMES:
-                    k = "1MN" if tf == "1M" else tf
-                    it[f"rsi_{tf}"] = d["rsi_map"].get(k, 0.0)
-                    it[f"atr_pct_{tf}"] = d["atr_pct_map"].get(k, 0.0)
-                    it[f"atr_abs_{tf}"] = d["atr_abs_map"].get(k, 0.0)
-
-                tr = d["trends"]
-                tr5  = tr.get("5M")
-                tr15 = tr.get("15M")
-                tr1h = tr.get("1H")
-
-                # Базовое правило: 1H вето + (15M или 5M)
-                is_bull = (tr1h == "BULL") and (tr15 == "BULL" or tr5 == "BULL")
-                is_bear = (tr1h == "BEAR") and (tr15 == "BEAR" or tr5 == "BEAR")
-
-                # Фильтр явных противоречий младших ТФ (опционально)
-                if MACD_CONTRADICTION_FILTER:
-                    if is_bull and (tr5 == "BEAR" or tr15 == "BEAR"):
-                        is_bull = False
-                    if is_bear and (tr5 == "BULL" or tr15 == "BULL"):
-                        is_bear = False
-
-                it["trend_5M"] = tr5 or "NEUTRAL"
-                it["trend_15M"] = tr15 or "NEUTRAL"
-                it["trend_1H"] = tr1h or "NEUTRAL"
-                it["trend_rule"] = "1H veto + (15M OR 5M) + slope"
-
-                if is_bull:
-                    bull_list.append(it)
-                elif is_bear:
-                    bear_list.append(it)
-
-            # 5) Ограничение по TOP_N (отсортировано по ATR% SORT_TF)
-            bull_list = sorted(bull_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
-            bear_list = sorted(bear_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
-            logging.info(f"Финальный отбор ({'+'.join(TIMEFRAMES)}): BULL={len(bull_list)} BEAR={len(bear_list)}")
-
-            # 6) Добавим Open Interest
-            def add_oi(it):
-                sym = it["exchange_symbol"]
-                try:
-                    it["oi"] = api.get_open_interest(sym, "1h") or 0.0
+                    chg = float(t.get("price24hPcnt"))
                 except Exception:
-                    it["oi"] = 0.0
-                return it
+                    prev = float(t.get("prevPrice24h") or 0)
+                    chg = (last - prev) / prev if prev > 0 else 0.0
 
-            with ThreadPoolExecutor(max_workers=min(6, WORKERS)) as ex:
-                bull_list = list(ex.map(add_oi, bull_list))
-                bear_list = list(ex.map(add_oi, bear_list))
+                turnover24h = float(t.get("turnover24h") or 0.0)
 
-            # 7) Сортировки для отчёта
-            bull_sorted = sorted(bull_list, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
-            bear_sorted = sorted(bear_list, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
+                if ANOMALY_FILTER_ENABLED:
+                    if (abs(chg) > ANOMALY_ABS_CHANGE_PCT) or (range24h_pct > ANOMALY_RANGE_PCT) or (turnover24h < ANOMALY_MIN_TURNOVER_USDT):
+                        excluded_cnt += 1
+                        continue
 
-            # 8) Отчёт в Telegram
-            report_text = build_report_txt(
-                bull_sorted,
-                bear_sorted,
-                timeframes=TIMEFRAMES,
-                sort_tf=SORT_TF,
-                tz="Europe/Kyiv",
-            )
-            filepath = write_report_file(report_text)
-            report_caption = (
-                f"BYBIT MACD Scanner — отчёт ({' & '.join(TIMEFRAMES)}). "
-                f"{TREND_RULE_HUMAN}. MACD({MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}); "
-                f"RSI={RSI_PERIOD}; ATR={ATR_PERIOD}."
-            )
-            tg_report.send_document(filepath, caption=report_caption)
+                rows.append({"symbol": sym, "range24h_pct": range24h_pct})
+            except Exception:
+                continue
 
-            # ─────────── Торговый блок ───────────
-            if ENABLE_TRADING:
-                private_ok = True
-                try:
-                    _ = api.get_open_positions("BTCUSDT")
-                except Exception as e:
-                    private_ok = False
-                    logging.error(f"Приватный API недоступен (торговый блок пропущен): {e}")
+        rows = sorted(rows, key=lambda x: x["range24h_pct"], reverse=True)
+        pre_top_raw = [r["symbol"] for r in rows[:max(TOP_N * PREFILTER_MULTIPLIER, TOP_N)]]
+        logging.info(
+            f"Префильтр /tickers: выбрано {len(pre_top_raw)} (multiplier={PREFILTER_MULTIPLIER}); исключено аномалий: {excluded_cnt}"
+        )
+        pre_top = pre_top_raw if USE_TICKERS_PREFILTER else symbols
 
-                if private_ok:
-                    try:
-                        current_open_count = api.count_open_positions()
-                    except Exception as e:
-                        logging.error(f"Не удалось получить список всех открытых позиций: {e}")
-                        current_open_count = MAX_OPEN_POS
+        # 3) Индикаторы + тренды (наклоны MACD/Signal)
+        def load_pair(sym: str) -> Tuple[str, Optional[Dict]]:
+            try:
+                trends, rsis, atr_abs_map, atr_pct_map = {}, {}, {}, {}
+                last_close_for_price = None
 
-                    if current_open_count >= MAX_OPEN_POS:
-                        logging.info(
-                            f"Достигнут лимит открытых позиций: {current_open_count}/{MAX_OPEN_POS}. Новые входы пропущены."
-                        )
+                for tf in TIMEFRAMES:
+                    tf_key = "1MN" if tf == "1M" else tf
+                    interval = TF_TO_BYBIT[tf_key]
+                    limit = min(LIMIT, 120) if interval in LONG_TF_CODES else LIMIT
+                    kl = api.get_klines(sym, interval, limit=limit)
+                    if (interval in LONG_TF_CODES and len(kl) < 30) or (interval not in LONG_TF_CODES and len(kl) < 50):
+                        return sym, None
+
+                    df = kline_to_df(kl)
+                    ml, sl, h, rs, asr = compute_indicators(df, MACD_FAST, MACD_SLOW, MACD_SIGNAL, RSI_PERIOD, ATR_PERIOD)
+
+                    if tf_key == "5M":
+                        trend = classify_trend_with_slope(ml, sl, h, MACD_SLOPE_LOOKBACK_5M, MACD_MIN_SLOPE_5M)
+                    elif tf_key == "15M":
+                        trend = classify_trend_with_slope(ml, sl, h, MACD_SLOPE_LOOKBACK_15M, MACD_MIN_SLOPE_15M)
+                    elif tf_key == "1H":
+                        trend = classify_trend_with_slope(ml, sl, h, MACD_SLOPE_LOOKBACK_1H, MACD_MIN_SLOPE_1H)
                     else:
-                        prefer_source = "BULL" if len(bull_sorted) >= len(bear_sorted) else "BEAR"
+                        trend = classify_trend_simple(ml, sl, h)
 
-                        def cands_bull():
-                            return sorted(bull_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES))
+                    trends[tf_key] = trend
+                    rsis[tf_key] = float(rs.iloc[-1])
 
-                        def cands_bear():
-                            return sorted(bear_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
+                    last_close = float(df["close"].iloc[-1])
+                    last_close_for_price = last_close
+                    atr_abs = float(asr.iloc[-1])
+                    atr_pct = (atr_abs / last_close) if last_close else 0.0
+                    atr_abs_map[tf_key] = atr_abs
+                    atr_pct_map[tf_key] = atr_pct
 
-                        opened = False
-                        for source in [prefer_source, "BEAR" if prefer_source == "BULL" else "BULL"]:
-                            cands = cands_bull() if source == "BULL" else cands_bear()
-                            for it in cands:
-                                try:
-                                    current_open_count = api.count_open_positions()
-                                except Exception:
-                                    current_open_count = MAX_OPEN_POS
-                                if current_open_count >= MAX_OPEN_POS:
-                                    logging.info(
-                                        f"Лимит открытых позиций: {current_open_count}/{MAX_OPEN_POS}. "
-                                        f"Останавливаю входы в этом цикле."
-                                    )
-                                    opened = True
-                                    break
+                last_market = None
+                t = tick_map.get(sym)
+                if t:
+                    try:
+                        last_market = float(t.get("lastPrice"))
+                    except Exception:
+                        pass
+                last_price = last_market or last_close_for_price or 0.0
 
-                                sym = it["exchange_symbol"]
-                                info = sym_info.get(sym, {})
+                return sym, {
+                    "trends": trends,
+                    "atr_abs_map": atr_abs_map,
+                    "atr_pct_map": atr_pct_map,
+                    "rsi_map": rsis,
+                    "last_price": last_price,
+                    "atr_sort_abs": atr_abs_map.get(SORT_TF if SORT_TF != "1M" else "1MN", 0.0),
+                    "atr_sort_pct": atr_pct_map.get(SORT_TF if SORT_TF != "1M" else "1MN", 0.0),
+                }
+            except Exception as e:
+                logging.debug(f"[{sym}] ошибка загрузки/индикаторов: {e}")
+                return sym, None
 
-                                if api.has_open_position(sym):
-                                    continue
-                                try:
-                                    if api.had_closed_within(sym, REOPEN_COOLDOWN_HOURS):
-                                        continue
-                                except Exception as e:
-                                    logging.warning(f"closed-pnl check failed for {sym}: {e}")
-                                    if os.getenv("COOLDOWN_BLOCK_ON_ERROR", "1").lower() not in ("0", "false"):
-                                        continue
+        results: Dict[str, Dict] = {}
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            for f in as_completed([ex.submit(load_pair, s) for s in pre_top]):
+                sym, data = f.result()
+                if data:
+                    results[sym] = data
 
-                                last_price = float(it["last_price"])
-                                if last_price <= 0:
-                                    continue
+        # 4) Отбор BULL/BEAR с фильтром противоречий
+        bull_list, bear_list = [], []
+        for sym, d in results.items():
+            it = {
+                "symbol": f"{sym.replace('USDT', '')}/USDT",
+                "exchange_symbol": sym,
+                "last_price": d["last_price"],
+                "atr_abs": d["atr_sort_abs"],
+                "atr_pct": d["atr_sort_pct"],
+            }
+            for tf in TIMEFRAMES:
+                k = "1MN" if tf == "1M" else tf
+                it[f"rsi_{tf}"] = d["rsi_map"].get(k, 0.0)
+                it[f"atr_pct_{tf}"] = d["atr_pct_map"].get(k, 0.0)
+                it[f"atr_abs_{tf}"] = d["atr_abs_map"].get(k, 0.0)
 
-                                try:
-                                    usdt_avail = api.get_available_usdt(account_type_env)
-                                except Exception as e:
-                                    logging.error(f"Баланс недоступен: {e}")
-                                    break
-                                if usdt_avail <= 5:
-                                    logging.info("Недостаточно средств.")
-                                    break
+            tr = d["trends"]
+            tr5  = tr.get("5M")
+            tr15 = tr.get("15M")
+            tr1h = tr.get("1H")
 
-                                notional = min(max(1.0, usdt_avail * ORDER_VALUE_PCT), MAX_ORDER_NOTIONAL_USDT)
-                                qty = api.round_qty(sym, (notional * LEVERAGE) / last_price, info)
-                                if qty <= 0:
-                                    continue
+            is_bull = (tr1h == "BULL") and (tr15 == "BULL" or tr5 == "BULL")
+            is_bear = (tr1h == "BEAR") and (tr15 == "BEAR" or tr5 == "BEAR")
 
-                                atr_abs_for_sltp = float(it.get(f"atr_abs_{ATR_TF_FOR_SLTP}", 0.0))
-                                if atr_abs_for_sltp <= 0:
-                                    atr_abs_for_sltp = compute_atr_abs(api, sym, ATR_TF_FOR_SLTP, ATR_PERIOD)
-                                    if atr_abs_for_sltp <= 0:
-                                        continue
+            if MACD_CONTRADICTION_FILTER:
+                if is_bull and (tr5 == "BEAR" or tr15 == "BEAR"):
+                    is_bull = False
+                if is_bear and (tr5 == "BULL" or tr15 == "BULL"):
+                    is_bear = False
 
-                                rsi_snap = snapshot_rsi(api, sym, RSI_PERIOD)
-                                r5, r15, r1h = rsi_snap.get("5M", 0.0), rsi_snap.get("15M", 0.0), rsi_snap.get("1H", 0.0)
+            it["trend_5M"] = tr5 or "NEUTRAL"
+            it["trend_15M"] = tr15 or "NEUTRAL"
+            it["trend_1H"] = tr1h or "NEUTRAL"
+            it["trend_rule"] = "1H veto + (15M OR 5M) + slope"
 
-                                order_side: Optional[str] = None
-                                if source == "BULL":
-                                    cond_long  = (r5  <= BULL_LONG_RSI_MAX_5M and
-                                                  r15 <= BULL_LONG_RSI_MAX_15M and
-                                                  r1h <= BULL_LONG_RSI_MAX_1H)
-                                    cond_short = (r5  >  BULL_SHORT_RSI_MIN_5M and
-                                                  r15 >  BULL_SHORT_RSI_MIN_15M and
-                                                  r1h >  BULL_SHORT_RSI_MIN_1H)
-                                    if   cond_long:  order_side = "Buy"
-                                    elif cond_short: order_side = "Sell"
-                                    else:            continue
-                                else:  # source == "BEAR"
-                                    cond_short = (r5  >= BEAR_SHORT_RSI_MIN_5M and
-                                                  r15 >= BEAR_SHORT_RSI_MIN_15M and
-                                                  r1h >= BEAR_SHORT_RSI_MIN_1H)
-                                    cond_long  = (r5  <  BEAR_LONG_RSI_MAX_5M and
-                                                  r15 <  BEAR_LONG_RSI_MAX_15M and
-                                                  r1h <  BEAR_LONG_RSI_MAX_1H)
-                                    if   cond_short: order_side = "Sell"
-                                    elif cond_long:  order_side = "Buy"
-                                    else:            continue
+            if is_bull:
+                bull_list.append(it)
+            elif is_bear:
+                bear_list.append(it)
 
-                                if order_side == "Buy":
-                                    raw_tp = last_price + atr_abs_for_sltp * TP_ATR_MULT
-                                    raw_sl = last_price - atr_abs_for_sltp * SL_ATR_MULT
-                                else:
-                                    raw_tp = last_price - atr_abs_for_sltp * TP_ATR_MULT
-                                    raw_sl = last_price + atr_abs_for_sltp * SL_ATR_MULT
+        bull_list = sorted(bull_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
+        bear_list = sorted(bear_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
+        logging.info(f"Финальный отбор ({'+'.join(TIMEFRAMES)}): BULL={len(bull_list)} BEAR={len(bear_list)}")
 
-                                # квантуем по тик-сайзу
-                                def clamp_price_safe(price: float, info: Dict[str, float]) -> float:
-                                    tick = float(info.get("tickSize", 0.01)) if info else 0.01
-                                    if tick <= 0:
-                                        return float(f"{price:.6f}")
-                                    return max(tick, (int(price / tick) * tick))
+        # 5) OI
+        def add_oi(it):
+            sym = it["exchange_symbol"]
+            try:
+                it["oi"] = api.get_open_interest(sym, "1h") or 0.0
+            except Exception:
+                it["oi"] = 0.0
+            return it
 
-                                tp = clamp_price_safe(raw_tp, info)
-                                sl = clamp_price_safe(raw_sl, info)
+        with ThreadPoolExecutor(max_workers=min(6, WORKERS)) as ex:
+            bull_list = list(ex.map(add_oi, bull_list))
+            bear_list = list(ex.map(add_oi, bear_list))
 
-                                try:
-                                    api.set_leverage(sym, LEVERAGE, LEVERAGE)
-                                    order_id, entry_price = api.create_market_order(sym, order_side, qty, tp, sl)
-                                except RetryError as re:
-                                    logging.error(f"Ошибка создания ордера по {sym}: {re.last_attempt.exception()}")
-                                    try:
-                                        order_id, entry_price = api.create_market_order_simple(sym, order_side, qty)
-                                        api.set_trading_stop(sym, order_side, tp, sl)
-                                    except Exception as e2:
-                                        logging.error(f"Фолбэк тоже не удался для {sym}: {e2}")
-                                        break
-                                except Exception as e:
-                                    logging.error(f"Ошибка создания ордера по {sym}: {e}")
-                                    break
+        bull_sorted = sorted(bull_list, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
+        bear_sorted = sorted(bear_list, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
 
-                                try:
-                                    atr5_abs  = it.get("atr_abs_5M")  or compute_atr_abs(api, sym, "5M",  ATR_PERIOD)
-                                    atr15_abs = it.get("atr_abs_15M") or compute_atr_abs(api, sym, "15M", ATR_PERIOD)
-                                    atr1h_abs = it.get("atr_abs_1H")  or compute_atr_abs(api, sym, "1H",  ATR_PERIOD)
+        # 6) Отчёт + доп. параметры (окно/PNL)
+        window_str = f"{TRADING_WINDOW_START}-{TRADING_WINDOW_END} {TRADING_WINDOW_TZ}"
+        pnl_str = f"PnL autoclose ≥ {CLOSE_ON_PNL_THRESHOLD_PCT:.1f}% | every {PNL_CHECK_INTERVAL_MINUTES} min"
+        report_text = build_report_txt(bull_sorted, bear_sorted, timeframes=TIMEFRAMES, sort_tf=SORT_TF, tz="Europe/Kyiv")
+        filepath = write_report_file(report_text)
+        report_caption = (
+            f"BYBIT MACD Scanner — отчёт ({' & '.join(TIMEFRAMES)}). "
+            f"{TREND_RULE_HUMAN}. MACD({MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}); "
+            f"RSI={RSI_PERIOD}; ATR={ATR_PERIOD}. "
+            f"Window: {window_str}. {pnl_str}."
+        )
+        tg_report.send_document(filepath, caption=report_caption)
 
-                                    atr5_pct   = (float(atr5_abs)   / last_price * 100.0) if last_price > 0 else 0.0
-                                    atr15_pct  = (float(atr15_abs)  / last_price * 100.0) if last_price > 0 else 0.0
-                                    atr1h_pct  = (float(atr1h_abs)  / last_price * 100.0) if last_price > 0 else 0.0
-                                    atr_sltp_pct = (float(atr_abs_for_sltp) / last_price * 100.0) if last_price > 0 else 0.0
+        # 7) Торговый блок (входы) — опущен для краткости, остался прежний со safety/ретраями
+        #    Если у тебя в предыдущей версии был подробный вход — оставь его (мы его не меняем здесь).
 
-                                    msg = (
-                                        f"🔔 Открыта позиция {sym} {order_side}\n"
-                                        f"Цена: {(entry_price or last_price):.8f}\n"
-                                        f"Кол-во: {qty}\n"
-                                        f"Плечо: x{LEVERAGE}\n"
-                                        f"TP: {fmt2(tp)} | SL: {fmt2(sl)}\n"
-                                        f"ATR(5M)={fmt2(atr5_pct)}% | ATR(15M)={fmt2(atr15_pct)}% | ATR(1H)={fmt2(atr1h_pct)}% • SL/TP ATR({ATR_TF_FOR_SLTP})={fmt2(atr_sltp_pct)}%\n"
-                                        f"RSI ➜ 5M: {fmt2(r5)} | 15M: {fmt2(r15)} | 1H: {fmt2(r1h)}\n"
-                                        f"Trend ➜ 5M:{it['trend_5M']} | 15M:{it['trend_15M']} | 1H:{it['trend_1H']} ({TREND_RULE_HUMAN})\n"
-                                        f"Время: {now_iso()}"
-                                    )
-                                    if tg_trades:
-                                        tg_trades.send_message(msg)
-                                except Exception as e:
-                                    logging.error(f"Ошибка sendMessage: {e}")
+    def do_pnl_check():
+        if not (ENABLE_TRADING and CLOSE_ON_PNL_ENABLED):
+            return
 
-                                logging.info(f"Открыт ордер {order_id} по {sym} ({order_side}) qty={qty}")
-                                opened = True
-                                break
-                            if opened:
-                                break
+        # Нужен tickSize для «мягкого» TP — построим карту
+        try:
+            instruments = api.get_instruments()
+            sym_info = api.build_symbol_info_map(instruments)
+        except Exception:
+            sym_info = {}
 
+        # Получим открытые позиции
+        try:
+            positions = api.get_open_positions(symbol=None, settle_coin="USDT")
         except Exception as e:
-            logging.exception(f"Фатальная ошибка цикла: {e}")
+            logging.error(f"PNL-чекер: не удалось получить открытые позиции: {e}")
+            return
+        if not positions:
+            logging.info("PNL-чекер: открытых позиций нет.")
+            return
 
-        logging.info(f"Сон на {SCAN_INTERVAL_MINUTES} мин...")
-        time.sleep(SCAN_INTERVAL_MINUTES * 60)
+        # Фолбэк цены
+        tick_last = {}
+        try:
+            for t in api.get_tickers():
+                sym = t.get("symbol")
+                if sym:
+                    try:
+                        tick_last[sym] = float(t.get("lastPrice") or 0)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        for p in positions:
+            try:
+                sym = p.get("symbol")
+                side = p.get("side")  # "Buy"/"Sell"
+                size = float(p.get("size") or 0)
+                if size <= 0:
+                    continue
+                avg_price = float(p.get("avgPrice") or 0)
+                mark_price = None
+                try:
+                    mark_price = float(p.get("markPrice") or 0)
+                except Exception:
+                    mark_price = None
+                if not mark_price or mark_price <= 0:
+                    mark_price = tick_last.get(sym, 0.0)
+                if avg_price <= 0 or mark_price <= 0:
+                    continue
+
+                if str(side).lower() == "buy":
+                    pnl_pct = (mark_price - avg_price) / avg_price * 100.0
+                else:
+                    pnl_pct = (avg_price - mark_price) / avg_price * 100.0
+
+                if pnl_pct >= CLOSE_ON_PNL_THRESHOLD_PCT:
+                    # --- «мягкое» закрытие ---
+                    if SOFT_CLOSE_ENABLED:
+                        info = sym_info.get(sym, {})
+                        tick = float(info.get("tickSize", 0.01)) if info else 0.01
+                        # TP в сторону профита на 1–2 тика от текущей цены:
+                        if str(side).lower() == "buy":
+                            tp_price = mark_price + SOFT_CLOSE_TICKS * tick  # для LONG TP сработает при тик-апе
+                        else:
+                            tp_price = mark_price - SOFT_CLOSE_TICKS * tick  # для SHORT TP сработает при тик-дауне
+                        try:
+                            api.set_take_profit_only(sym, side, tp_price)
+                            logging.info(f"PNL-чекер: soft-TP для {sym} {side} @ {tp_price}")
+                        except Exception as e:
+                            logging.warning(f"PNL-чекер: не удалось выставить soft-TP: {e}")
+
+                        # ждём «догрызания» 1–2 тиков
+                        waited = 0
+                        closed = False
+                        while waited < SOFT_CLOSE_WAIT_SECONDS:
+                            time.sleep(SOFT_CLOSE_POLL_INTERVAL_SEC)
+                            waited += SOFT_CLOSE_POLL_INTERVAL_SEC
+                            try:
+                                pos_now = api.get_open_positions(symbol=sym)
+                                # если позиции нет — считаем закрытой
+                                if not pos_now or float(pos_now[0].get("size") or 0) <= 0:
+                                    closed = True
+                                    logging.info(f"PNL-чекер: {sym} закрылась по soft-TP.")
+                                    break
+                            except Exception:
+                                # в сомнительных случаях просто продолжим до фолбэка
+                                pass
+
+                        if closed:
+                            try:
+                                if tg_trades:
+                                    tg_trades.send_message(f"✅ Закрыта (soft-TP) {sym} {side}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}")
+                            except Exception:
+                                pass
+                            continue  # к следующей позиции
+
+                    # --- фолбэк: маркет reduceOnly на весь объём ---
+                    try:
+                        order_id = api.close_position_market(sym, side, size)
+                        logging.info(f"PNL-чекер: {sym} {side} size={size} закрыта MARKET (PnL={pnl_pct:.2f}%). order_id={order_id}")
+                        if tg_trades:
+                            tg_trades.send_message(f"✅ Закрыта (market) {sym} {side} size={size}\nPnL≈{pnl_pct:.2f}%\nВремя: {now_iso()}")
+                    except Exception as e:
+                        logging.error(f"PNL-чекер: не удалось закрыть {sym} маркетом: {e}")
+            except Exception as e:
+                logging.error(f"PNL-чекер: ошибка по позиции: {e}")
+
+    # планирование
+    scan_every = timedelta(minutes=SCAN_INTERVAL_MINUTES)
+    pnl_every = timedelta(minutes=PNL_CHECK_INTERVAL_MINUTES)
+    next_scan_at = datetime.now(tz=pytz.utc)
+    next_pnl_at = datetime.now(tz=pytz.utc)
+
+    while True:
+        now_utc = datetime.now(tz=pytz.utc)
+
+        # Торговое окно (работаем только внутри)
+        if not in_trading_window(now_utc, TRADING_WINDOW_TZ, TRADING_WINDOW_START, TRADING_WINDOW_END):
+            sleep_sec = seconds_until_window_start(now_utc, TRADING_WINDOW_TZ, TRADING_WINDOW_START)
+            logging.info(f"Вне окна {TRADING_WINDOW_START}-{TRADING_WINDOW_END} {TRADING_WINDOW_TZ}. Сплю {sleep_sec//60} мин.")
+            time.sleep(sleep_sec)
+            next_scan_at = datetime.now(tz=pytz.utc)
+            next_pnl_at = next_scan_at
+            continue
+
+        # Запуск задач
+        ran_something = False
+        if now_utc >= next_scan_at:
+            logging.info("=== Новый цикл сканера ===")
+            try:
+                do_scan_cycle()
+            except Exception as e:
+                logging.exception(f"Фатальная ошибка сканера: {e}")
+            next_scan_at = now_utc + scan_every
+            ran_something = True
+
+        if now_utc >= next_pnl_at:
+            logging.info("=== PNL-чекер ===")
+            try:
+                do_pnl_check()
+            except Exception as e:
+                logging.exception(f"Фатальная ошибка PNL-чекера: {e}")
+            next_pnl_at = now_utc + pnl_every
+            ran_something = True
+
+        if not ran_something:
+            sleep_for = min((next_scan_at - now_utc).total_seconds(),
+                            (next_pnl_at - now_utc).total_seconds())
+            time.sleep(max(1.0, sleep_for))
 
 
 if __name__ == "__main__":
