@@ -1,4 +1,11 @@
 # main.py
+# Полный рабочий скрипт сканера/трейдера Bybit (V5, unified)
+# - торговое окно по Киеву (env: TRADING_WINDOW_TZ/START/END)
+# - сканер с MACD slope-фильтром, аномалиями, отчётом в Telegram
+# - торговый блок (входы) с подробными логами и авто-даунсайзом при 110007
+# - PnL-чекер с «мягким» закрытием (soft TP) и фолбэком MARKET reduceOnly
+# - Render-friendly: все переменные берутся из окружения; .env необязателен
+
 import os
 import time
 import logging
@@ -24,6 +31,7 @@ from telegram_utils import TelegramClient
 
 TF_TO_BYBIT = {
     "5M": "5",
+    "10M": "10",  # если когда-то включите 10M на аггрегированных барах
     "15M": "15",
     "30M": "30",
     "1H": "60",
@@ -271,19 +279,13 @@ def main_loop():
     ANOMALY_RANGE_PCT = env_float("ANOMALY_RANGE_PCT", 1.00)
     ANOMALY_MIN_TURNOVER_USDT = env_float("ANOMALY_MIN_TURNOVER_USDT", 1_000_000.0)
 
-    TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "5M,15M,1H"))
-    SORT_TF = check_sort_tf(os.getenv("SORT_TF", "15M"), TIMEFRAMES)
+    TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "15M,1H,4H"))
+    SORT_TF = check_sort_tf(os.getenv("SORT_TF", "1H"), TIMEFRAMES)
     REOPEN_COOLDOWN_HOURS = env_int("REOPEN_COOLDOWN_HOURS", 2)
     if ATR_TF_FOR_SLTP not in TIMEFRAMES:
         TIMEFRAMES.append(ATR_TF_FOR_SLTP)
 
     TREND_RULE_HUMAN = "1H veto + (15M OR 5M) + MACD slope check"
-
-    logging.info(f"Активные ТФ: {', '.join(TIMEFRAMES)} | отсечка TopN по ATR%: {SORT_TF}")
-    logging.info(
-        f"Аномалий-фильтр: enabled={ANOMALY_FILTER_ENABLED}, |24h change|>{ANOMALY_ABS_CHANGE_PCT*100:.0f}%, "
-        f"range>{ANOMALY_RANGE_PCT*100:.0f}%, turnover24h<{ANOMALY_MIN_TURNOVER_USDT:.0f} USDT"
-    )
 
     TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -299,10 +301,15 @@ def main_loop():
     position_mode = (os.getenv("POSITION_MODE") or "one_way").strip().lower()
     account_type_env = (os.getenv("BYBIT_ACCOUNT_TYPE") or "UNIFIED").strip().upper()
 
+    logging.info(f"Активные ТФ: {', '.join(TIMEFRAMES)} | отсечка TopN по ATR%: {SORT_TF}")
+    logging.info(
+        f"Аномалий-фильтр: enabled={ANOMALY_FILTER_ENABLED}, |24h change|>{ANOMALY_ABS_CHANGE_PCT*100:.0f}%, "
+        f"range>{ANOMALY_RANGE_PCT*100:.0f}%, turnover24h<{ANOMALY_MIN_TURNOVER_USDT:.0f} USDT"
+    )
     logging.info(f"Bybit base: {base_url} | sign_style={sign_style} | Trading={'ON' if ENABLE_TRADING else 'OFF'}")
 
     api = BybitAPI(
-        category=os.getenv("BYBIT_CATEGORY", "linear"),
+        category=CATEGORY,
         sleep_ms=SLEEP_MS,
         max_retries=MAX_RETRIES,
         retry_backoff_sec=RETRY_BACKOFF,
@@ -314,12 +321,30 @@ def main_loop():
         position_mode=position_mode,
     )
 
+    def verify_private_api_or_explain():
+        try:
+            _ = api.get_wallet_balance(account_type_env)
+            logging.info("Private API OK: get_wallet_balance прошёл.")
+        except Exception as e:
+            logging.error(f"Private API ERROR: get_wallet_balance не прошёл: {e}")
+        try:
+            _ = api.get_open_positions("BTCUSDT")
+            logging.info("Private API OK: get_open_positions прошёл.")
+        except Exception as e:
+            logging.error(f"Private API ERROR: get_open_positions не прошёл: {e}")
+
+    if "api.bybit.com" in base_url and sign_style != "headers":
+        logging.warning("Mainnet обнаружен, а BYBIT_SIGN_STYLE != headers. "
+                        "На mainnet обычно нужен headers (Sign-Type=2). "
+                        "Поставь BYBIT_SIGN_STYLE=headers в переменных окружения.")
+    verify_private_api_or_explain()
+
     # -------- планировщик задач: scan и pnl-check --------
     def do_scan_cycle():
         # 1) Инструменты
         instruments = api.get_instruments()
         symbols = [it["symbol"] for it in instruments]
-        sym_info = api.build_symbol_info_map(instruments)
+        sym_info_all = api.build_symbol_info_map(instruments)
         logging.info(f"Всего символов: {len(symbols)}")
 
         # 2) Префильтр по /tickers (+ аномалии)
@@ -357,7 +382,7 @@ def main_loop():
         rows = sorted(rows, key=lambda x: x["range24h_pct"], reverse=True)
         pre_top_raw = [r["symbol"] for r in rows[:max(TOP_N * PREFILTER_MULTIPLIER, TOP_N)]]
         logging.info(
-            f"Префильтр /tickers: выбрано {len(pre_top_raw)} (multiplier={PREFILTER_MULTIPLIER}); исключено аномалий: {excluded_cnt}"
+            f"Префильтр /tickers: выбрано  {len(pre_top_raw)} (multiplier={PREFILTER_MULTIPLIER}); исключено аномалий: {excluded_cnt}"
         )
         pre_top = pre_top_raw if USE_TICKERS_PREFILTER else symbols
 
@@ -499,23 +524,205 @@ def main_loop():
         )
         tg_report.send_document(filepath, caption=report_caption)
 
-        # 7) Торговый блок (входы) — опущен для краткости, остался прежний со safety/ретраями
-        #    Если у тебя в предыдущей версии был подробный вход — оставь его (мы его не меняем здесь).
+        # 7) ТОРГОВЫЙ БЛОК — ПОЛНЫЙ
+        if not ENABLE_TRADING:
+            logging.info("Trading OFF (ENABLE_TRADING=0) — входы не выполняются.")
+            return
+
+        private_ok = True
+        try:
+            _ = api.get_open_positions("BTCUSDT")
+        except Exception as e:
+            private_ok = False
+            logging.error(f"Приватный API недоступен — входы пропущены: {e}")
+        if not private_ok:
+            return
+
+        try:
+            if "api.bybit.com" in api.base_url and api.sign_style != "headers":
+                logging.warning("Mainnet + sign_style=params: высок шанс отказов на ордерах. "
+                                "Поставь BYBIT_SIGN_STYLE=headers (Sign-Type=2).")
+        except Exception:
+            pass
+
+        try:
+            current_open_count = api.count_open_positions()
+        except Exception as e:
+            logging.error(f"Не удалось получить число открытых позиций: {e}")
+            current_open_count = MAX_OPEN_POS
+
+        if current_open_count >= MAX_OPEN_POS:
+            logging.info(f"Лимит открытых позиций достигнут: {current_open_count}/{MAX_OPEN_POS}. Новые входы пропущены.")
+            return
+
+        prefer_source = "BULL" if len(bull_sorted) >= len(bear_sorted) else "BEAR"
+        def cands_bull(): return sorted(bull_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES))
+        def cands_bear(): return sorted(bear_sorted, key=lambda it: rsi_sum(it, TIMEFRAMES), reverse=True)
+
+        opened = False
+        for source in [prefer_source, "BEAR" if prefer_source == "BULL" else "BULL"]:
+            cands = cands_bull() if source == "BULL" else cands_bear()
+            logging.info(f"Пробую источник={source}, кандидатов={len(cands)}")
+
+            for it in cands:
+                try:
+                    current_open_count = api.count_open_positions()
+                except Exception:
+                    current_open_count = MAX_OPEN_POS
+                if current_open_count >= MAX_OPEN_POS:
+                    logging.info(f"Стоп: лимит открытых позиций {current_open_count}/{MAX_OPEN_POS}.")
+                    opened = True
+                    break
+
+                sym = it["exchange_symbol"]
+                last_price = float(it["last_price"] or 0.0)
+                if last_price <= 0:
+                    logging.debug(f"{sym}: пропуск — last_price<=0")
+                    continue
+
+                if api.has_open_position(sym):
+                    logging.debug(f"{sym}: пропуск — уже есть открытая позиция.")
+                    continue
+
+                try:
+                    if api.had_closed_within(sym, REOPEN_COOLDOWN_HOURS):
+                        logging.debug(f"{sym}: пропуск — кулдаун {REOPEN_COOLDOWN_HOURS} ч.")
+                        continue
+                except Exception as e:
+                    logging.warning(f"{sym}: проверка closed-pnl не удалась: {e}")
+                    if os.getenv("COOLDOWN_BLOCK_ON_ERROR", "1").lower() not in ("0", "false"):
+                        continue
+
+                try:
+                    usdt_avail = api.get_available_usdt(account_type_env)
+                except Exception as e:
+                    logging.error(f"{sym}: баланс недоступен: {e}")
+                    break
+                if usdt_avail <= 5:
+                    logging.info(f"{sym}: пропуск — мало средств usdt_avail={usdt_avail:.2f}.")
+                    break
+
+                base_notional = min(max(1.0, usdt_avail * ORDER_VALUE_PCT), MAX_ORDER_NOTIONAL_USDT)
+                notional_try = base_notional * ORDER_SAFETY_MARGIN_PCT
+
+                atr_abs_for_sltp = float(it.get(f"atr_abs_{ATR_TF_FOR_SLTP}", 0.0))
+                if atr_abs_for_sltp <= 0:
+                    atr_abs_for_sltp = compute_atr_abs(api, sym, ATR_TF_FOR_SLTP, ATR_PERIOD)
+                    if atr_abs_for_sltp <= 0:
+                        logging.debug(f"{sym}: пропуск — atr_abs_for_sltp=0.")
+                        continue
+
+                rsi_snap = snapshot_rsi(api, sym, RSI_PERIOD)
+                r5, r15, r1h = rsi_snap.get("5M", 0.0), rsi_snap.get("15M", 0.0), rsi_snap.get("1H", 0.0)
+
+                order_side: Optional[str] = None
+                if source == "BULL":
+                    cond_long  = (r5  <= BULL_LONG_RSI_MAX_5M and r15 <= BULL_LONG_RSI_MAX_15M and r1h <= BULL_LONG_RSI_MAX_1H)
+                    cond_short = (r5  >  BULL_SHORT_RSI_MIN_5M and r15 >  BULL_SHORT_RSI_MIN_15M and r1h >  BULL_SHORT_RSI_MIN_1H)
+                    if   cond_long:  order_side = "Buy"
+                    elif cond_short: order_side = "Sell"
+                    else:
+                        logging.debug(f"{sym}: пропуск — RSI для BULL не выполнены: r5={r5:.2f}, r15={r15:.2f}, r1h={r1h:.2f}")
+                        continue
+                else:
+                    cond_short = (r5  >= BEAR_SHORT_RSI_MIN_5M and r15 >= BEAR_SHORT_RSI_MIN_15M and r1h >= BEAR_SHORT_RSI_MIN_1H)
+                    cond_long  = (r5  <  BEAR_LONG_RSI_MAX_5M and r15 <  BEAR_LONG_RSI_MAX_15M and r1h <  BEAR_LONG_RSI_MAX_1H)
+                    if   cond_short: order_side = "Sell"
+                    elif cond_long:  order_side = "Buy"
+                    else:
+                        logging.debug(f"{sym}: пропуск — RSI для BEAR не выполнены: r5={r5:.2f}, r15={r15:.2f}, r1h={r1h:.2f}")
+                        continue
+
+                info = sym_info_all.get(sym, {})
+                if order_side == "Buy":
+                    raw_tp = last_price + atr_abs_for_sltp * TP_ATR_MULT
+                    raw_sl = last_price - atr_abs_for_sltp * SL_ATR_MULT
+                else:
+                    raw_tp = last_price - atr_abs_for_sltp * TP_ATR_MULT
+                    raw_sl = last_price + atr_abs_for_sltp * SL_ATR_MULT
+                tp = api.clamp_price_safe(raw_tp, info)
+                sl = api.clamp_price_safe(raw_sl, info)
+
+                try:
+                    api.set_leverage(sym, LEVERAGE, LEVERAGE)
+                except Exception as e:
+                    logging.warning(f"{sym}: set_leverage не прошёл: {e}")
+
+                retry_left = 3
+                order_id = None
+                entry_price = None
+
+                while retry_left > 0:
+                    qty = api.round_qty(sym, (notional_try * LEVERAGE) / last_price, info)
+                    if qty <= 0:
+                        logging.info(f"{sym}: qty=0 при notional={notional_try:.4f}. Прерываю.")
+                        break
+                    logging.info(f"{sym}: создаю ордер side={order_side}, notional={notional_try:.4f}, qty={qty}")
+
+                    try:
+                        order_id, entry_price = api.create_market_order(sym, order_side, qty, tp, sl)
+                        break
+                    except RetryError as re:
+                        msg = str(re.last_attempt.exception())
+                        if "110007" in msg or "not enough" in msg.lower():
+                            retry_left -= 1
+                            notional_try *= 0.8
+                            logging.warning(f"{sym}: 110007 (недостаточно средств), уменьшаю notional до {notional_try:.4f}, попыток: {retry_left}")
+                            continue
+                        logging.error(f"{sym}: ошибка создания ордера (RetryError): {msg}")
+                        break
+                    except Exception as e:
+                        m = str(e)
+                        if "110007" in m or "not enough" in m.lower():
+                            retry_left -= 1
+                            notional_try *= 0.8
+                            logging.warning(f"{sym}: 110007 (недостаточно средств), уменьшаю notional до {notional_try:.4f}, попыток: {retry_left}")
+                            continue
+                        logging.error(f"{sym}: ошибка создания ордера: {e}")
+                        break
+
+                if not order_id and retry_left > 0:
+                    qty = api.round_qty(sym, (notional_try * LEVERAGE) / last_price, info)
+                    if qty > 0:
+                        try:
+                            order_id, entry_price = api.create_market_order_simple(sym, order_side, qty)
+                            api.set_trading_stop(sym, order_side, tp, sl)
+                        except Exception as e2:
+                            logging.error(f"{sym}: фолбэк без TP/SL тоже не удался: {e2}")
+
+                if not order_id:
+                    logging.info(f"{sym}: ордер не создан — следующий кандидат.")
+                    continue
+
+                try:
+                    if tg_trades:
+                        tg_trades.send_message(
+                            f"🔔 Открыта позиция {sym} {order_side}\n"
+                            f"Цена: {(entry_price or last_price):.8f}\n"
+                            f"Кол-во: {qty}\nПлечо: x{LEVERAGE}\nTP: {tp:.8f} | SL: {sl:.8f}\n"
+                            f"Время: {now_iso()}"
+                        )
+                except Exception:
+                    pass
+
+                logging.info(f"Открыт ордер {order_id} по {sym} ({order_side})")
+                opened = True
+                break
+            if opened:
+                break
 
     def do_pnl_check():
         """
         Автозакрытие по прибыли:
-        - каждые PNL_CHECK_INTERVAL_MINUTES (внешний планировщик) вызывается этот метод
-        - если PnL% >= CLOSE_ON_PNL_THRESHOLD_PCT:
-            * (опционально) ставим мягкий TP в сторону профита на N тиков и ждём,
-            * если не исполнилось — маркет reduceOnly.
-        Устойчив к временным ошибкам /v5/position/list: просто пропускает цикл с логом.
+          - если PnL% >= CLOSE_ON_PNL_THRESHOLD_PCT:
+              * (опционально) ставим мягкий TP в сторону профита на N тиков и ждём,
+              * если не исполнилось — маркет reduceOnly.
         """
         if not (ENABLE_TRADING and CLOSE_ON_PNL_ENABLED):
             logging.debug("PNL-чекер: выключен (ENABLE_TRADING=0 или CLOSE_ON_PNL_ENABLED=0).")
             return
 
-        # 1) Загружаем инструменты для получения tickSize (нужно для мягкого TP).
+        # tickSize для мягкого TP
         try:
             instruments = api.get_instruments()
             sym_info = api.build_symbol_info_map(instruments)
@@ -523,7 +730,7 @@ def main_loop():
             logging.warning(f"PNL-чекер: не удалось получить инструменты (tickSize), продолжу без них: {e}")
             sym_info = {}
 
-        # 2) Открытые позиции (метод в bybit_api уже «мягкий» и может вернуть []).
+        # Позиции
         try:
             positions = api.get_open_positions(symbol=None, settle_coin="USDT")
         except Exception as e:
@@ -534,7 +741,7 @@ def main_loop():
             logging.info("PNL-чекер: открытых позиций нет (или приватный API вернул пусто).")
             return
 
-        # 3) Фолбэк-цены по lastPrice (если у позиции нет markPrice).
+        # Фолбэк lastPrice
         tick_last: Dict[str, float] = {}
         try:
             for t in api.get_tickers():
@@ -548,7 +755,6 @@ def main_loop():
         except Exception as e:
             logging.warning(f"PNL-чекер: не удалось получить lastPrice тиков: {e}")
 
-        # 4) Обход позиций
         for p in positions:
             try:
                 sym = p.get("symbol")
@@ -556,13 +762,11 @@ def main_loop():
                 if not sym or side.lower() not in ("buy", "sell"):
                     continue
 
-                # В hedge-режиме Bybit может прислать две записи по одному символу (лонг/шорт) — это ок.
                 size = float(p.get("size") or 0.0)
                 if size <= 0:
                     continue
 
                 avg_price = float(p.get("avgPrice") or 0.0)
-                # markPrice может не прийти (или =0) — используем lastPrice из tikers
                 try:
                     mark_price = float(p.get("markPrice") or 0.0)
                 except Exception:
@@ -574,53 +778,39 @@ def main_loop():
                     logging.debug(f"PNL-чекер: пропуск {sym} — avg_price={avg_price}, mark_price={mark_price}.")
                     continue
 
-                # 5) PnL% как процент движения цены (без плеча)
-                if side.lower() == "buy":
-                    pnl_pct = (mark_price - avg_price) / avg_price * 100.0
-                else:
-                    pnl_pct = (avg_price - mark_price) / avg_price * 100.0
-
+                pnl_pct = ((mark_price - avg_price) / avg_price * 100.0) if side.lower() == "buy" else ((avg_price - mark_price) / avg_price * 100.0)
                 logging.info(f"PNL-чекер: {sym} {side} size={size} avg={avg_price:.8f} mark={mark_price:.8f} pnl%={pnl_pct:.2f}")
 
                 if pnl_pct < CLOSE_ON_PNL_THRESHOLD_PCT:
-                    continue  # порог не достигнут
+                    continue
 
-                # === достигли порога прибыли ===
-
-                # 6) Мягкое закрытие: выставляем TP поблизости и ждём N секунд
+                # --- «мягкое» закрытие ---
                 if SOFT_CLOSE_ENABLED:
                     info = sym_info.get(sym, {})
                     tick = float(info.get("tickSize", 0.0)) if info else 0.0
                     if tick <= 0:
-                        # запасной вариант, если нет меты по тик-сайзу
                         tick = 0.01
-
                     ticks = max(1, int(SOFT_CLOSE_TICKS))
                     if side.lower() == "buy":
-                        tp_price = mark_price + ticks * tick    # для LONG — ждём тик вверх
+                        tp_price = mark_price + ticks * tick
                     else:
-                        tp_price = mark_price - ticks * tick    # для SHORT — ждём тик вниз
-
-                    # нормализуем цену под шаг тика
+                        tp_price = mark_price - ticks * tick
                     try:
                         tp_price = api.clamp_price_safe(tp_price, info)
                     except Exception:
                         pass
-
                     try:
                         api.set_take_profit_only(sym, side, tp_price)
                         logging.info(f"PNL-чекер: выставлен soft-TP {sym} {side} @ {tp_price}")
                     except Exception as e:
                         logging.warning(f"PNL-чекер: не удалось выставить soft-TP для {sym}: {e}")
 
-                    # ждём исполнения TP
                     waited = 0
                     closed_by_soft = False
                     while waited < SOFT_CLOSE_WAIT_SECONDS:
                         time.sleep(max(1, int(SOFT_CLOSE_POLL_INTERVAL_SEC)))
                         waited += max(1, int(SOFT_CLOSE_POLL_INTERVAL_SEC))
                         try:
-                            # если позиции нет или объём 0 — считаем закрытой
                             pos_now = api.get_open_positions(symbol=sym)
                             has_size = False
                             for pp in (pos_now or []):
@@ -634,7 +824,6 @@ def main_loop():
                                 break
                         except Exception as e:
                             logging.debug(f"PNL-чекер: опрос позиции {sym} после soft-TP не удался: {e}")
-                            # продолжаем ждать до фолбэка
 
                     if closed_by_soft:
                         try:
@@ -644,9 +833,9 @@ def main_loop():
                                 )
                         except Exception:
                             pass
-                        continue  # к следующей позиции
+                        continue
 
-                # 7) Фолбэк: закрываем маркетом reduceOnly на весь объём
+                # --- фолбэк: маркет reduceOnly ---
                 try:
                     order_id = api.close_position_market(sym, side, size)
                     logging.info(
@@ -665,8 +854,7 @@ def main_loop():
             except Exception as e:
                 logging.error(f"PNL-чекер: ошибка обработки позиции: {e}")
 
-
-    # планирование
+    # интервал запуска задач
     scan_every = timedelta(minutes=SCAN_INTERVAL_MINUTES)
     pnl_every = timedelta(minutes=PNL_CHECK_INTERVAL_MINUTES)
     next_scan_at = datetime.now(tz=pytz.utc)
@@ -684,7 +872,6 @@ def main_loop():
             next_pnl_at = next_scan_at
             continue
 
-        # Запуск задач
         ran_something = False
         if now_utc >= next_scan_at:
             logging.info("=== Новый цикл сканера ===")
